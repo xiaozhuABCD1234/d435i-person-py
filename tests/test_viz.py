@@ -130,10 +130,12 @@ def test_fall_alert_panel_states() -> None:
     assert "躯干 89°" in down and "已 2.5 s" in down
 
     person.fall_level, person.fall_state = FALLEN, "摔倒"
-    alarm = fall_alert_panel(people, history=["10.2s #1 检测到摔倒"], now=12.5)
+    alarm = fall_alert_panel(
+        people, history=[(10.2, "#1 摔倒", "#1 检测到摔倒（躯干 90°）")], now=12.5
+    )
     assert alarm.startswith("# 摔倒 #")
     assert "摔倒 ·" in alarm  # 状态名跟在 id 后面
-    assert "最近：10.2s #1 检测到摔倒" in alarm
+    assert "最近：10.2s #1 检测到摔倒（躯干 90°）" in alarm  # 纯文本副本用长写法
     assert "倒地中" not in alarm.split("\n")[1]  # 确认后不再写“倒地中”
 
 
@@ -159,10 +161,12 @@ def test_fall_light_colors_by_level() -> None:
     person = people[0]
     person.metrics["torso_angle"] = 71.4
     person.fall_level, person.lying, person.fall_since = SUSPECT, True, 10.0
-    color, lines = fall_light(people, history=["10.2s #1 疑似摔倒"], now=12.5)
+    history = [(4.3, "#1 疑似", "#1 疑似摔倒 / 倒地中（躯干 52°）")]
+    color, lines = fall_light(people, history=history, now=12.5)
     assert color == LIGHT_COLORS[SUSPECT] and lines[0] == "疑似倒地 #1"
-    assert lines[1] == "#1 · 躯干 71° · 距 2.0 m · 已 2.5 s"  # 明细行不重复状态名
-    assert lines[2] == "最近 10.2s #1 疑似摔倒"
+    assert lines[1] == "#1 · 躯干 71° · 2.0 m · 2.5 s"  # 格内用短写法（太长会被裁）
+    assert lines[2] == "最近 4.3s #1 疑似"
+    assert len(lines) == 3  # 只放最近一次状态变化，多了占满格子
 
     person.fall_level, person.fall_state = FALLEN, "摔倒"
     color, lines = fall_light(people, now=13.0)  # 13×2 是偶数 -> 亮相位

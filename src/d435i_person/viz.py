@@ -21,7 +21,7 @@
 ``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米，默认关）
 ``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
-``person/fall_light``                摔倒报警灯（一格 2D：红=摔倒（会闪）/ 琥珀=疑似倒地 / 绿=正常）
+``person/fall_light``                摔倒报警灯（一格 2D：整格变色 + 格内文字；红=摔倒会闪）
 ``person/fall_alert``                报警灯的纯文本副本（markdown，可选中复制）
 ``person/fall``                      摔倒状态变化日志（只在跳变时记一条）
 ===================================  =======================================
@@ -66,18 +66,24 @@ ALARM_COLOR = (255, 64, 64)  # 摔倒报警色（2D/3D 都换成它，比“看�
 # 摔倒报警灯：占「摔倒警报」那一格（2D 视图：整格一块颜色 + 白字）。
 # 用颜色而不是表情符号：颜色是屏幕上最先被看见的东西，也不会有字体缺字的问题。
 LIGHT_ORIGIN = "person/fall_light"
-LIGHT_BG = f"{LIGHT_ORIGIN}/bg"  # 底色，让色块边缘有边界
-LIGHT_STATE = f"{LIGHT_ORIGIN}/state"  # 状态灯那块颜色
-LIGHT_TEXT = f"{LIGHT_ORIGIN}/text"  # 状态与明细（2D 标签：屏幕像素大小，格子小也看得清）
+LIGHT_STATE = f"{LIGHT_ORIGIN}/state"  # 铺满整格的色块（2×2 纯色图）
+LIGHT_TEXT = f"{LIGHT_ORIGIN}/text"  # 格内文字（2D 标签：屏幕像素大小，格子小也看得清）
 LIGHT_COLORS: dict[int, tuple[int, int, int]] = {
     NORMAL: (48, 200, 96),  # 绿：正常
     SUSPECT: (255, 176, 32),  # 琥珀：疑似倒地
     FALLEN: (255, 64, 64),  # 红：摔倒（跟“整个人变红”同一个色）
 }
 LIGHT_IDLE_COLOR = (90, 100, 120)  # 画面内无人：暗蓝灰（故意不用绿——没人在 ≠ 一切正常）
-LIGHT_BG_COLOR = (32, 34, 38)
-LIGHT_TEXT_COLOR = (235, 235, 235)
+LIGHT_TEXT_COLOR = (255, 255, 255)
 LIGHT_FLASH_DIM = 0.35  # 闪烁的暗相位保留多少亮度（还看得出是红灯）
+# 色块怎么画：这个版本的 rr.Boxes2D 只画边框（没有 fill_mode），Points2D 只能画圆盘，
+# 真正“铺满整格的矩形”只能用纯色小图（试出来的：1×1 的图 rerun 会画成白屏，2×2 正常）。
+# 图占 [0,SIZE]²，所以坐标就用图像自己的 [0,SIZE]²：即使 visual_bounds 取不到
+# （老版本退回自动取景），文字也还在色块中间。
+LIGHT_FILL_SIZE = 2
+# 文字锚点（图像坐标）：rerun 的 2D 标签以锚点为中心、向上展开，所以锚点给图中心稍下一点，
+# 几行字才落在色块中间；x 给图中心才是左右居中（靠边会被格子裁掉）。
+LIGHT_TEXT_ANCHOR = (LIGHT_FILL_SIZE / 2, 0.935)
 ALERT_TEXT_ORIGIN = "person/fall_alert"  # 纯文本副本（可选中/可复制，记着不花什么钱）
 
 
@@ -217,9 +223,9 @@ def value_line(person) -> str:
 
 
 def _fall_detail(person, now: float | None = None, *, with_state: bool = True) -> str:
-    """警报里的一行：谁、什么状态、躯干多横、多远、已经多久了。
+    """纯文本副本里的一行（长写法）：谁、什么状态、躯干多横、多远、已经多久了。
 
-    ``with_state=False`` 时省掉状态名（报警灯标题里已经写了，明细行重复就啰嗦）。
+    ``with_state=False`` 时省掉状态名（标题里已经写了，明细行重复就啰嗦）。
     """
     level = int(getattr(person, "fall_level", 0))
     parts = [f"#{person.id}"]
@@ -233,6 +239,24 @@ def _fall_detail(person, now: float | None = None, *, with_state: bool = True) -
     since = getattr(person, "fall_since", None)
     if since is not None and now is not None:
         parts.append(f"已 {max(now - since, 0.0):.1f} s")
+    return " · ".join(parts)
+
+
+def _light_detail(person, now: float | None = None) -> str:
+    """报警灯格内的一行（短写法）：``#1 · 躯干 90° · 4.1 m · 0.7 s``。
+
+    格内文字是居中画的、不会自动折行，太长就左右被格子裁掉，所以这里去掉“距/已”这类字，
+    只留数字与单位。
+    """
+    parts = [f"#{person.id}"]
+    angle = person.metrics.get("torso_angle")
+    if angle is not None and np.isfinite(angle):
+        parts.append(f"躯干 {angle:.0f}°")
+    if np.isfinite(person.distance):
+        parts.append(f"{person.distance:.1f} m")
+    since = getattr(person, "fall_since", None)
+    if since is not None and now is not None:
+        parts.append(f"{max(now - since, 0.0):.1f} s")
     return " · ".join(parts)
 
 
@@ -269,9 +293,9 @@ def fall_light(
         and int(now * flash_hz) % 2
     ):
         color = tuple(int(c * LIGHT_FLASH_DIM) for c in color)  # 暗相位：暗下去但还看得出是红的
-    lines = [head, *(_fall_detail(p, now, with_state=False) for p in [*alarmed, *down])]
-    if history:
-        lines.append("最近 " + "；".join(list(history)[-2:]))
+    lines = [head, *(_light_detail(p, now) for p in [*alarmed, *down])]
+    # 格内只放最近一次状态变化（多了会把格子占满，完整的在纯文本副本里）
+    lines += [f"最近 {t:.1f}s {short}" for t, short, _ in list(history)[-1:]]
     return color, lines
 
 
@@ -299,7 +323,7 @@ def fall_alert_panel(people, history=(), now: float | None = None) -> str:
         head = "画面内无人"
     lines = [head, *(f"- {_fall_detail(person, now)}" for person in [*alarmed, *down])]
     if history:
-        lines += ["", "最近：" + "；".join(history)]
+        lines += ["", "最近：" + "；".join(f"{t:.1f}s {long}" for t, _, long in history)]
     return "\n".join(lines)
 
 
@@ -381,7 +405,7 @@ class RerunView:
         self._coords_logged: set[str] = set()
         self._styled_series: set[str] = set()  # 已经声明过颜色的曲线（只声明一次）
         self._fall_levels: dict[int, int] = {}  # 每个人的摔倒等级，用于只在跳变时记事件
-        self._fall_history: deque = deque(maxlen=3)  # 警报框里附的“最近”几条
+        self._fall_history: deque = deque(maxlen=3)  # 报警灯里附的“最近”几条 (时刻, 短, 长)
 
         rr.init(app_id, spawn=False)
         if save_path:
@@ -482,10 +506,10 @@ class RerunView:
         return grid(*views)
 
     def _alarm_view(self, rrb, origin: str, name: str):
-        """报警灯那一格：2D 视图，坐标系锁在单位方格上。
+        """报警灯那一格：2D 视图，坐标系锁在色块的 [0,2]² 上。
 
-        不锁的话 rerun 会按内容自动取景，色块在格子里的位置会跟着内容漂；锁成 [0,1]²
-        后色块就是“整格一块颜色”，和报警灯的样子一致。
+        不锁的话 rerun 会按内容自动取景；锁住后色块就是“整格一块颜色”，与报警灯的样子一致
+        （内容就是 [0,2]² 的色块，所以两种情况下画面一样）。
         """
         bounds = getattr(rrb, "VisualBounds2D", None)
         if bounds is not None:
@@ -493,7 +517,9 @@ class RerunView:
                 return rrb.Spatial2DView(
                     origin=origin,
                     name=name,
-                    visual_bounds=bounds(x_range=[0.0, 1.0], y_range=[0.0, 1.0]),
+                    visual_bounds=bounds(
+                        x_range=[0.0, LIGHT_FILL_SIZE], y_range=[0.0, LIGHT_FILL_SIZE]
+                    ),
                 )
         return rrb.Spatial2DView(origin=origin, name=name)
 
@@ -693,7 +719,8 @@ class RerunView:
         """摔倒状态一变就记一条 TextLog（rerun 的文本日志面板里能看到整串时间线）。
 
         只在跳变时记，不是每帧都记：报警从“倒地中”到“摔倒”再到“已恢复”一共就几条。
-        文案不带表情符号（这些字会跟着“最近”进报警灯那一格，那格要求无表情）。
+        历史存三元组 (时刻, 短写法, 长写法)：报警灯那格用短写法（格子窄，长了会被裁），
+        纯文本副本用长写法。文案不带表情符号（这些字会进报警灯那一格，那格要求无表情）。
         """
         rr = self.rr
         for person in live:
@@ -704,12 +731,12 @@ class RerunView:
             angle = person.metrics.get("torso_angle")
             detail = f"（躯干 {angle:.0f}°）" if angle is not None and np.isfinite(angle) else ""
             if level >= FALLEN:
-                text = f"#{person.id} 检测到摔倒{detail}"
+                text, short = f"#{person.id} 检测到摔倒{detail}", f"#{person.id} 摔倒"
             elif level == SUSPECT:
-                text = f"#{person.id} 疑似摔倒 / 倒地中{detail}"
+                text, short = f"#{person.id} 疑似摔倒 / 倒地中{detail}", f"#{person.id} 疑似"
             else:
-                text = f"#{person.id} 已恢复正常"
-            self._fall_history.append(f"{t:.1f}s {text}")
+                text, short = f"#{person.id} 已恢复正常", f"#{person.id} 恢复"
+            self._fall_history.append((t, short, text))
             self._log("person/fall", rr.TextLog(text))
 
     def _log_fall_light(self, live, t: float) -> None:
@@ -719,24 +746,24 @@ class RerunView:
         记一次颜色”实现，所以 keep_history=False 的 static 记录也照样闪。
         """
         rr = self.rr
-        boxes = getattr(rr, "Boxes2D", None)
         points = getattr(rr, "Points2D", None)
-        if boxes is None or points is None:  # pragma: no cover - 老版本
+        if points is None:  # pragma: no cover - 老版本
             return
         color, lines = fall_light(live, self._fall_history, t, flash_hz=self.fall_light_flash)
-        # Boxes2D 本身就填色，没有 fill_mode 参数（这个版本的签名里没有）
+        # 纯色小图铺满整格：那一格本身就是“色块”，文字画在它里面（居中）
         self._log(
-            LIGHT_BG, boxes(centers=[[0.5, 0.5]], sizes=[[1.0, 1.0]], colors=[LIGHT_BG_COLOR])
+            LIGHT_STATE,
+            rr.Image(np.full((LIGHT_FILL_SIZE, LIGHT_FILL_SIZE, 3), color, dtype=np.uint8)),
         )
-        self._log(LIGHT_STATE, boxes(centers=[[0.5, 0.74]], sizes=[[0.86, 0.18]], colors=[color]))
-        # 2D 标签的文字是屏幕像素大小：格子缩小也不会看不见（不像图像里的字会跟着缩）
+        # 2D 标签的文字是屏幕像素大小：格子缩小也不会看不见（不像图像里的字会跟着缩）；
+        # 锚点为什么在那儿见 LIGHT_TEXT_ANCHOR 的注释（居中 + 向上展开）。
         self._log(
             LIGHT_TEXT,
             points(
-                positions=[[0.07, 0.46]],
+                positions=[list(LIGHT_TEXT_ANCHOR)],
                 labels=["\n".join(lines)],
                 colors=[LIGHT_TEXT_COLOR],
-                radii=[0.004],
+                radii=[0.0],
             ),
         )
 
