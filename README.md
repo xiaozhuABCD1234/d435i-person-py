@@ -27,6 +27,12 @@ rerun blueprint、卡尔曼 + IoU 跟踪、按需 `annotate()`），区别只在
 
 ```bash
 uv sync                                  # torch/cv2 命中 uv 缓存
+
+# 仓库不含 .pt 权重，第一次跑之前先下（默认 x；想真跑到 60 Hz 就换 m/n）
+BASE=https://github.com/ultralytics/assets/releases/download/v8.4.0
+curl -L --create-dirs -o models/yolo26x-pose.pt $BASE/yolo26x-pose.pt
+curl -L -o models/yolo26m-pose.pt $BASE/yolo26m-pose.pt
+
 uv run d435i-person --list               # 枚举 RealSense 设备
 uv run d435i-person --show-config        # 打印合并后的生效参数
 uv run d435i-person                      # 按 config.toml 跑（开 rerun 窗口）
@@ -418,7 +424,7 @@ uv run python tools/bench.py             # 分阶段计时：取流/YOLO/跟踪/
 ```
 d435i-person-py/
 ├── config.toml                 全部参数（唯一的"旋钮面板"）
-├── models/                     yolo26n/m/x-pose.pt（默认用 x，见"模型选择与 60 fps"）
+├── models/                     yolo26*-pose.pt（不入库，按「快速开始」下载；默认 x）
 ├── src/d435i_person/
 │   ├── __main__.py             CLI + 主循环（限速、点云/JSONL 的频率、存图）
 │   ├── config.py               参数读取/校验/命令行覆盖
@@ -465,14 +471,6 @@ uv run python tools/bench.py --no-camera --weights models/yolo26n-pose.pt   # �
 uv run python tools/check_camera.py --frames 60              # 只看相机侧帧率与深度质量
 ```
 
-自己复现/换参数：
-
-```bash
-uv run python tools/bench.py --frames 200                    # 分阶段（含相机）
-uv run python tools/bench.py --no-camera --weights models/yolo26n-pose.pt   # 不占相机比模型
-uv run python tools/check_camera.py --frames 60              # 只看相机侧帧率与深度质量
-```
-
 ## 故障排查
 
 | 现象 | 原因 / 处理 |
@@ -506,4 +504,5 @@ uv run python tools/check_camera.py --frames 60              # 只看相机侧�
 ## 许可证
 
 AGPL-3.0-or-later（与 `hik-person-py` 一致）。`pyrealsense2` / librealsense 遵循其
-自带 Apache-2.0。
+自带 Apache-2.0；仓库不含 `.pt` 权重，那些是 ultralytics 官方预训练权重（同样 AGPL-3.0），
+按「快速开始」的命令另行下载。

@@ -22,3 +22,6 @@ shots/
 .idea/
 *.swp
 .DS_Store
+
+# 权重全部不入库（x 档 126 MB；下载命令见 README「快速开始」/「模型选择与 60 fps」）
+models/*.pt
