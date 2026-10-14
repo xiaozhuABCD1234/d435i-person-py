@@ -184,6 +184,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖 [rerun].show_values：每人一行极简数值（默认开）",
     )
     p.add_argument(
+        "--metrics-views",
+        default=None,
+        help="覆盖 [rerun].metrics_views：指标曲线分哪几个框，如 speed,size,gait"
+        "（默认 all = 全部组；也可以直接写单个指标名，如 height）",
+    )
+    p.add_argument(
+        "--metrics-layout",
+        default=None,
+        choices=["grid", "stack", "single"],
+        help="覆盖 [rerun].metrics_layout：格子/一框一行/全塞回一个框",
+    )
+    p.add_argument(
         "--metrics",
         dest="metrics_enabled",
         action=argparse.BooleanOptionalAction,
@@ -411,6 +423,8 @@ def main(argv: list[str] | None = None) -> int:
             show_count=settings.rerun_show_count,
             show_metrics=settings.rerun_show_metrics,
             show_values=settings.rerun_show_values,
+            metrics_views=settings.rerun_metrics_views,
+            metrics_layout=settings.rerun_metrics_layout,
         )
         if rrd:
             print(f"rerun 记录 -> {rrd}")

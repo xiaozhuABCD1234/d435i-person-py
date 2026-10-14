@@ -16,16 +16,18 @@
 ``camera/pose3d/positions``          每个人的 3D 位置（标签 = id + 距离）
 ``world/...``                       世界系 3D 视图根（RIGHT_HAND_Z_UP，可选）
 ``world/{points,joints,skeleton,trails,positions}``  世界系副本（刚体变换后）
-``person/metrics/<指标>/<id>``       人体指标曲线：速度/身高/肩宽/髀宽/步频/步幅/腿长…
+``person/metrics/<组>/<指标>/<id>``  人体指标曲线（按组拆框：速度/尺寸/长度/步态/可信度）
 ``person/values``                    极简数值行（每人一行短文本）
 ``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米，默认关）
 ``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
 ===================================  =======================================
 
-右上角默认是**人体指标曲线** + 一列极简数值行（每人一行，不是大段表格），
-用 ``show_metrics`` / ``show_values`` / ``show_coords`` / ``show_count`` 控制。
-每个人的颜色由 id 决定，所以同一 id 在 2D 与 3D 里同色，一眼看得出谁是谁。
+右上角默认是**按组拆开的指标曲线框**（速度 / 尺寸 / 长度 / 步态 / 可信度，用
+``metrics_views`` 选组、``metrics_layout`` 选摆法）+ 一列极简数值行（每人一行，
+不是大段表格），用 ``show_metrics`` / ``show_values`` / ``show_coords`` /
+``show_count`` 控制。每个人的颜色由 id 决定，所以同一 id 在 2D、3D 以及各个
+曲线框里都是同一种颜色（曲线颜色是显式声明的，不靠路径哈希）。
 
 进 rerun 前统一 `bgr_to_rgb()`：`rr.Image` 默认按 RGB 解读三通道数据，直接喂 BGR
 会红蓝互换。
@@ -34,6 +36,7 @@
 from __future__ import annotations
 
 import contextlib
+import sys
 
 import numpy as np
 
@@ -68,6 +71,54 @@ VALUE_FIELDS: tuple[tuple[str, str, str, int], ...] = (
     ("cadence", "步频", "步/分", 0),
     ("stride", "步幅", "m", 2),
 )
+
+# 指标分组：一个框里塞十几条线根本看不清，按"什么时候会一起看"拆成几个视图。
+# 键 = 实体路径里的那一段（person/metrics/<键>/<指标>/<id>），也是 [rerun].metrics_views
+# 里能选的组名（也可以用单个指标名，比如只要看 height 就写 height）。
+METRIC_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("speed", "速度", ("speed", "speed_ground")),
+    ("size", "尺寸（高/肩/髀）", ("height", "shoulder_width", "hip_width")),
+    ("length", "长度（躯干/腿/臂展）", ("torso", "leg", "arm_span")),
+    ("gait", "步态（步频/步幅）", ("cadence", "stride")),
+    ("quality", "可信度", ("coverage",)),
+)
+
+# 指标 -> 组；没列进去的新指标落到 "other"（数据照记，只是没预置视图）。
+METRIC_GROUP_OF: dict[str, str] = {
+    metric: group for group, _, metrics in METRIC_GROUPS for metric in metrics
+}
+
+
+def metric_path(metric: str, person_id: int) -> str:
+    """指标曲线的实体路径：按组分层，TimeSeriesView 才能一组一个框。"""
+    group = METRIC_GROUP_OF.get(metric, "other")
+    return f"person/metrics/{group}/{metric}/{person_id}"
+
+
+def _parse_metric_views(spec: str | None) -> list[tuple[str, str, str]]:
+    """把 ``--metrics-views`` 解析成 [(origin, 图名, 组名)]。
+
+    ``"all"``/空 = 所有组（默认）；否则用逗号/空格分隔的组名或指标名，比如
+    ``speed,height,gait``。选到单个指标时就只给它一个框（origin 落到那一级）。
+    """
+    if not spec or spec.strip().lower() in {"all", "*"}:
+        return [(f"person/metrics/{group}", label, group) for group, label, _ in METRIC_GROUPS]
+    known_groups = {group: label for group, label, _ in METRIC_GROUPS}
+    picked: list[tuple[str, str, str]] = []
+    unknown: list[str] = []
+    for token in spec.replace(",", " ").split():
+        if token in known_groups:
+            picked.append((f"person/metrics/{token}", known_groups[token], token))
+        elif token in METRIC_GROUP_OF:
+            group = METRIC_GROUP_OF[token]
+            picked.append((f"person/metrics/{group}/{token}", token, group))
+        else:
+            unknown.append(token)
+    if unknown:
+        # 名字打错就静静退回“全都在一个框里”，太容易让人以为自己没改对，影响一下
+        options = " ".join(known_groups) + " 或单个指标名（如 height）"
+        print(f"[viz] 认不出的指标组：{', '.join(unknown)}；可选：{options}", file=sys.stderr)
+    return picked
 
 
 def value_line(person) -> str:
@@ -121,6 +172,8 @@ class RerunView:
         show_count: bool = False,
         show_metrics: bool = True,
         show_values: bool = True,
+        metrics_views: str = "all",
+        metrics_layout: str = "grid",
     ):
         """跑起来就弹 viewer（除非给了 save_path）。
 
@@ -147,9 +200,16 @@ class RerunView:
         self.show_count = bool(show_count)
         self.show_metrics = bool(show_metrics)
         self.show_values = bool(show_values)
+        # 想少几个框：--metrics-views speed,height （组名或单个指标名，逗号/空格分隔）
+        self.metric_views = _parse_metric_views(metrics_views)
+        # grid = 2 行多列的格子；stack = 一框一行地堆；single = 全塞回一个框
+        self.metrics_layout = (
+            metrics_layout if metrics_layout in {"grid", "stack", "single"} else "grid"
+        )
         self._last_count: int | None = None
         self._image_size: tuple[int, int] | None = None
         self._coords_logged: set[str] = set()
+        self._styled_series: set[str] = set()  # 已经声明过颜色的曲线（只声明一次）
 
         rr.init(app_id, spawn=False)
         if save_path:
@@ -193,8 +253,9 @@ class RerunView:
                 top.append(rrb.TextDocumentView(origin="person/values", name="数值"))
                 top_shares.append(1)
             if self.show_metrics:
-                top.append(rrb.TimeSeriesView(origin="person/metrics", name="人体指标"))
-                top_shares.append(3)
+                # 指标曲线按组拆框：一个框里十几条线根本看不清
+                top.append(self._metrics_panel(rrb))
+                top_shares.append(5)
             if self.show_coords:
                 top.append(rrb.TimeSeriesView(origin="person/coords", name="坐标"))
                 top_shares.append(2)
@@ -222,6 +283,26 @@ class RerunView:
             # blueprint API 不可用就用 rerun 的默认布局，不影响记录本身
             return
         self.rr.send_blueprint(blueprint)
+
+    def _metrics_panel(self, rrb):
+        """指标曲线面板：单个组 / Grid 多框 / 一框一行地堆。
+
+        ``metrics_views`` 选组（默认全上），``metrics_layout`` 定摆法。单组时直接
+        给个 TimeSeriesView（不再套容器，省一层边框）。
+        """
+        picked = self.metric_views or [("person/metrics", "人体指标", "all")]
+        views = [rrb.TimeSeriesView(origin=origin, name=name) for origin, name, _ in picked]
+        if self.metrics_layout == "single":
+            # 想要回“一个大框全在里面”就 single
+            return rrb.TimeSeriesView(origin="person/metrics", name="人体指标")
+        if len(views) == 1:
+            return views[0]
+        if self.metrics_layout == "stack":
+            return rrb.Vertical(*views)
+        grid = getattr(rrb, "Grid", None)
+        if grid is None:  # pragma: no cover - 老版本没有 Grid
+            return rrb.Vertical(*views)
+        return grid(*views)
 
     def _make_3d_view(self, rrb, origin: str, name: str):
         """3D 视图，眼位钉在相机坐标系的默认位置。
@@ -264,6 +345,34 @@ class RerunView:
             self.rr.log(entity, data)
         else:
             self.rr.log(entity, data, static=True)
+
+    def _log_scalar(
+        self, entity: str, value: float, *, person_id: int | None = None, name: str | None = None
+    ) -> None:
+        """标量曲线：**带时间戳**（跟 ``_log`` 的 static 相反），否则画不成曲线。
+
+        样式（颜色 + 图例名）只在第一次记：不写的话 rerun 会按路径哈希分配颜色，
+        同一个人在不同指标框里可能是不同颜色，而且图例显示的是完整实体路径。
+        现在每个实体自己声明颜色和 ``#id`` 图例名，各框之间颜色一致。
+        """
+        rr = self.rr
+        scalar = getattr(rr, "Scalars", None) or rr.Scalar
+        rr.log(entity, scalar(float(value)))
+        if entity in self._styled_series:
+            return
+        self._styled_series.add(entity)
+        lines = getattr(rr, "SeriesLines", None)
+        if lines is None:  # pragma: no cover - 老版本没有 SeriesLines
+            return
+        kwargs: dict = {}
+        if person_id is not None:
+            kwargs["colors"] = [color_for(person_id)]
+        if name or person_id is not None:
+            kwargs["names"] = [name or f"#{person_id}"]
+        if not kwargs:
+            return
+        with contextlib.suppress(Exception):
+            rr.log(entity, lines(**kwargs), static=True)
 
     def _encode(self, bgr: np.ndarray):
         """按 jpeg_quality 压过再送。
@@ -313,17 +422,20 @@ class RerunView:
 
         # 标量一直带时间戳（曲线靠它们画）：人数、人体指标、以及每个人的位置坐标。
         self._set_time(number)
-        scalar = getattr(rr, "Scalars", None) or rr.Scalar
-        rr.log("person/count", scalar(count))
+        self._log_scalar("person/count", count, name="人数")
         if self.show_metrics or self.show_coords:
             for person in live:
                 if self.show_metrics:
                     for key, value in person.metrics.items():
                         if np.isfinite(value):
-                            rr.log(f"person/metrics/{key}/{person.id}", scalar(float(value)))
+                            self._log_scalar(
+                                metric_path(key, person.id), float(value), person_id=person.id
+                            )
                 if self.show_coords and np.isfinite(person.position).all():
                     for axis, value in zip("xyz", person.position, strict=True):
-                        rr.log(f"person/coords/{person.id}/{axis}", scalar(float(value)))
+                        self._log_scalar(
+                            f"person/coords/{person.id}/{axis}", float(value), person_id=person.id
+                        )
         if self.show_values:
             self._log_values(live)
 

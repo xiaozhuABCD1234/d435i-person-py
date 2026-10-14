@@ -83,6 +83,10 @@ class Settings:
     rerun_show_values: bool = True
     rerun_show_coords: bool = False
     rerun_show_count: bool = False
+    # 指标曲线分哪几组（all = 全部）与怎么摆：
+    #   grid = 格子（默认，一行放得下就几个）；stack = 一框一行地堆；single = 全塞回一个框
+    rerun_metrics_views: str = "all"
+    rerun_metrics_layout: str = "grid"
 
     # -------------------------------------------------------------- [metrics]
     # 人体指标（速度/步态/尺寸）。关掉就少算一点，也不记 person/metrics/*。
@@ -181,6 +185,8 @@ CONFIG_FIELDS: dict[tuple[str, str], str] = {
     ("rerun", "show_count"): "rerun_show_count",
     ("rerun", "show_metrics"): "rerun_show_metrics",
     ("rerun", "show_values"): "rerun_show_values",
+    ("rerun", "metrics_views"): "rerun_metrics_views",
+    ("rerun", "metrics_layout"): "rerun_metrics_layout",
     ("metrics", "enabled"): "metrics_enabled",
     ("metrics", "speed_smoothing"): "speed_smoothing",
     ("metrics", "speed_deadband"): "speed_deadband",

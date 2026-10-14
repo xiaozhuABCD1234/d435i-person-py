@@ -245,14 +245,33 @@ JSON Lines 里每人也多一个 `world` 字段。
 | `camera/pose3d/joints` `skeleton` | 真深度 3D 骨架 |
 | `camera/pose3d/trails` `positions` | 轨迹、每人 3D 位置（短标签带距离与速度） |
 | `world/...` | 世界系视图（`[world].enabled` 时才记） |
-| `person/metrics/<指标>/<id>` | **人体指标曲线**：速度/地面速度/身高/肩宽/髀宽/腿长/臂展/步频/步幅/coverage |
+| `person/metrics/<组>/<指标>/<id>` | **人体指标曲线**，按组拆框：`speed` 速度、`size` 高/肩/髀、`length` 躯干/腿/臂展、`gait` 步频/步幅、`quality` coverage |
 | `person/values` | 每人一行极简数值（短文本，见下方"数值行"） |
 | `person/coords/<id>/{x,y,z}` | 坐标曲线（相机系，默认关） |
 | `person/count` | 人数标量（数据一直在，只是默认不占面板） |
 | `person/events` | 人数变化日志 |
 
-布局：左边彩色（下面对齐深度），右边 **人体指标曲线 + 数值行** + 3D 骨架/点云
-（+ 世界系视图）。每个人的颜色由 id 决定，2D 和 3D 里同一个 id 同色，一眼看得出谁是谁。
+布局：左边彩色（下面对齐深度），右边 **按组拆开的指标曲线框** + 3D 骨架/点云
+（+ 世界系视图）。每个人的颜色由 id 决定，2D、3D 以及各个曲线框里同一个 id 都是
+同色（曲线颜色是显式声明的，图例直接显示 `#1`，不是一长串实体路径）。
+
+指标按“什么时候会一起看”拆成 5 个框（用 `[rerun].metrics_views` / `--metrics-views` 选）：
+
+| 框 | 里面是什么 |
+| --- | --- |
+| `speed` | `speed`、`speed_ground`（两条） |
+| `size` | `height`、`shoulder_width`、`hip_width` |
+| `length` | `torso`、`leg`、`arm_span` |
+| `gait` | `cadence`、`stride` |
+| `quality` | `coverage`（有效关节比例，可信度自检） |
+
+```bash
+uv run d435i-person                             # 默认：5 个框的格子
+uv run d435i-person --metrics-views speed,size     # 只看速度与尺寸
+uv run d435i-person --metrics-views height         # 只给身高一个框
+uv run d435i-person --metrics-layout stack         # 一框一行地堆
+uv run d435i-person --metrics-layout single        # 回到“一个大框全在里面”
+```
 
 故意的：**没有大段文字**。数值行是每人一行、只列本帧真有的项：
 
@@ -261,7 +280,9 @@ JSON Lines 里每人也多一个 `world` 字段。
 - #2 · 距 1.02 m · 速 0.00 m/s · 静止 · 肩宽 0.44 m
 ```
 
-面板用 `[rerun]` 的 `show_metrics` / `show_values` / `show_coords` / `show_count` 开关；
+面板用 `[rerun]` 的 `show_metrics` / `show_values` / `show_coords` / `show_count` 开关，
+指标框的组成与摆法用 `metrics_views` / `metrics_layout`（两个都有对应的 `--metrics-views` /
+`--metrics-layout` 临时覆盖）；
 曲线默认是**相机坐标系**（X 右 / Y 下 / Z 前），开了 `[world]` 后曲线轴含义不变，
 但指标里的"上方向"已经换成了世界 Z（所以身高不受镜头俯仰影响）。
 
@@ -379,7 +400,8 @@ uv run python tools/check_camera.py --frames 60              # 只看相机侧�
 | 身高数字一跳一跳 | 关键点在头/踝处不够稳（头发、裙摆、地面阴影）；把 `[metrics].height_min/max` 收紧，或看 `coverage` 曲线判断哪些帧不可信 |
 | 相机设了 60 fps，但日志只有 15 fps 端到端 | 正常：`detect_hz` 是按模型能力设的，x 模型 64.5 ms/帧。想要 60 Hz 推理换 n（`--weights models/yolo26n-pose.pt --detect-hz 60`）；日志里的"X 帧跳推理"就是为它丢的帧 |
 | 启动报 `Couldn't resolve requests`（60 fps 时） | 某些固件/机型下彩色 60 fps 只支持特定格式：本机 640x480 的 RGB8/BGR8/YUYV 都支持 @60，1280x720 只有 @30/15/6 |
-| 右上角看不到坐标表 | 需要 `[rerun].show_coords = true`（默认已开）；表格在窗口偏窄时需要拖分隔条或拉宽窗口 |
+| 右上角看不到坐标/指标曲线 | 坐标曲线需 `[rerun].show_coords = true`（默认关）；指标曲线看 `show_metrics` 与 `metrics_views` |
+| 指标框太多/太空（不走路就没步态曲线） | `--metrics-views speed,size` 只留要看的组，或 `--metrics-layout single` 换回一个大框 |
 | 3D 骨架"呼吸"/抖 | 提高 `[pose3d].kalman_measurement`（更平滑），或开 `--temporal` 深度滤镜 |
 | 两个人换 id | 调大 `[track].iou_threshold`，或设 `match_max_distance = 1.0`（米） |
 | id 越用越多、同一个人被数两遍 | `[track].max_missed` 调大（容忍更久的遮挡），或 `detect_hz` 调高 |
