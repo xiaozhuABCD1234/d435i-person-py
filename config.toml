@@ -156,6 +156,35 @@ height_min = 1.2
 height_max = 2.2
 stand_cos = 0.8
 
+[fall]
+# 摔倒检测（状态机在 fall.py）。三步判据：冲击 -> 躺倒 -> 持续，缺一步不报警。
+# 它不受 [metrics].enabled 影响：安全类功能不该因为“不看尺寸”就没了。
+# 用 --no-fall 临时关掉，--fall 打开。
+#
+# 已知边界：主动快速躺到地上也会报（速度和姿态与摔倒分不开）；被抱起来搬走可能
+# 误报。这只能靠报警后人工确认——本模块只负责报，不做抑制。
+enabled = true
+
+# 冲击（短时间内的快速下沉）：向下速度超过 impact_speed，或者 impact_window 秒内
+# 从窗口高点掉了 drop_height（后者靠真深度实测，速度滤波滞后时也能兜住）。
+impact_speed = 1.0
+impact_window = 0.7
+drop_height = 0.35
+
+# 躺倒：躯干与“上”方向夹角超过 lying_angle 度；角度测不到（躺着时关键点常被
+# 床/腿挡住）就用“比站立参考高度低 lying_height 米”兜底——站立参考是自动学的
+# （只在正常且直立时更新的 EMA），所以不用量相机装多高。
+lying_angle = 60.0
+lying_height = 0.35
+
+# 时序：躺倒连续保持 lying_time 秒才确认报警（把“蹲一下又起来”排掉）；冲击后
+# confirm_window 秒内没能确认就当没事（慢慢躺下没有冲击，本来也不会进这一步）。
+# 报警后要直立保持 recover_time 秒才解除（爬起来的过程中不闪烁）。
+lying_time = 1.2
+confirm_window = 3.0
+recover_angle = 35.0
+recover_time = 1.0
+
 [pose3d]
 # 整个 3D 链路的总开关：关掉后不记 3D 骨架/轨迹/点云/深度图，也不输出世界坐标，
 # 只留 2D（人照样带 id）——想省 viewer 内存或只看检测框时用 --no-pose3d。

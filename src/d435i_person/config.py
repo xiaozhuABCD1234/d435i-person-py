@@ -105,6 +105,20 @@ class Settings:
     height_max: float = 2.2
     stand_cos: float = 0.8
 
+    # ---------------------------------------------------------------- [fall]
+    # 摔倒检测（见 fall.py）。它不受 [metrics].enabled 影响：安全类功能不该因为
+    # “不看尺寸”就没了。
+    fall_enabled: bool = True
+    fall_impact_speed: float = 1.0  # m/s：向下速度超过它算冲击
+    fall_drop_height: float = 0.35  # m：窗口内从高点掉这么多也算冲击
+    fall_impact_window: float = 0.7  # s：下沉判据的时间窗口
+    fall_lying_angle: float = 60.0  # 度：躯干与"上"夹角超过它算躺倒
+    fall_lying_height: float = 0.35  # m：低于站立参考这么多也算躺倒（角度遮住时兜底）
+    fall_lying_time: float = 1.2  # s：躺倒连续保持多久才确认
+    fall_confirm_window: float = 3.0  # s：冲击后多久内确认有效，超时就当没事
+    fall_recover_angle: float = 35.0  # 度：恢复到直立
+    fall_recover_time: float = 1.0  # s：直立保持多久才解除报警
+
     # ---------------------------------------------------------------- [pose3d]
     pose3d_enabled: bool = True
     pose3d_kalman: bool = True
@@ -197,6 +211,16 @@ CONFIG_FIELDS: dict[tuple[str, str], str] = {
     ("metrics", "height_min"): "height_min",
     ("metrics", "height_max"): "height_max",
     ("metrics", "stand_cos"): "stand_cos",
+    ("fall", "enabled"): "fall_enabled",
+    ("fall", "impact_speed"): "fall_impact_speed",
+    ("fall", "drop_height"): "fall_drop_height",
+    ("fall", "impact_window"): "fall_impact_window",
+    ("fall", "lying_angle"): "fall_lying_angle",
+    ("fall", "lying_height"): "fall_lying_height",
+    ("fall", "lying_time"): "fall_lying_time",
+    ("fall", "confirm_window"): "fall_confirm_window",
+    ("fall", "recover_angle"): "fall_recover_angle",
+    ("fall", "recover_time"): "fall_recover_time",
     ("pose3d", "enabled"): "pose3d_enabled",
     ("pose3d", "kalman"): "pose3d_kalman",
     ("pose3d", "kalman_process"): "pose3d_kalman_process",

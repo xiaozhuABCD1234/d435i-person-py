@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .fall import FallConfig, FallDetector, torso_angle
 from .geometry import Intrinsics, depth_valid_mask, lift_keypoints
 from .pose import KEYPOINT_NAMES_17, PoseInstance
 from .pose3d import (
@@ -63,6 +64,9 @@ class MetricsConfig:
     height_min: float = HEIGHT_RANGE[0]
     height_max: float = HEIGHT_RANGE[1]
     stand_cos: float = STAND_COS
+    # 摔倒检测：独立的时序状态机（见 fall.py），[fall] 段配置。它在 [metrics].enabled
+    # 关掉时也照跑——安全类功能不该因为“不看尺寸”就没了。
+    fall: FallConfig = field(default_factory=FallConfig)
 
     def up_vector(self) -> np.ndarray:
         return np.asarray(self.up, dtype=np.float64)
@@ -183,6 +187,10 @@ class TrackedPerson:
     missed: int  # 最近连续漏检帧数（0 = 本帧命中了）
     valid_count: int  # 本帧有效关键点个数
     state_speed: float = 0.15  # 状态标签阀值：低于它显示"静止"
+    fall_level: int = 0  # 0 正常 / 1 疑似摔倒 / 2 摔倒（报警）
+    fall_state: str = ""  # 摔倒状态的中文短标签（正常时为空串）
+    fall_since: float | None = None  # 当前状态的起始时刻（报警时刻看它）
+    lying: bool = False  # 本帧是躺倒姿态（配 fall_level=1 就是在“倒地”过程中）
 
     @property
     def distance(self) -> float:
@@ -225,6 +233,7 @@ class _Track:
     prev_position: np.ndarray = field(default_factory=lambda: np.full(3, np.nan, np.float32))
     prev_t: float = 0.0
     gait: _Gait = field(default_factory=lambda: _Gait(4.0, 0.8))
+    fall: FallDetector = field(default_factory=FallDetector)
     missed: int = 0
     age: int = 0
     last_t: float = 0.0
@@ -322,6 +331,7 @@ class PersonTracker:
             prev_position=np.asarray(position, dtype=np.float32).copy(),
             prev_t=t,
             gait=_Gait(self.metrics.gait_window, self.metrics.gait_lift_k),
+            fall=FallDetector(self.metrics.fall),
             missed=0,
             age=1,
             last_t=t,
@@ -438,7 +448,8 @@ class PersonTracker:
             show = track.seen & (track.missed_kpt <= self.max_missed_kpt)
             raw = track.raw if track.raw is not None else np.full((NUM_KP, 3), np.nan, np.float32)
             joints, names, strips = to_display(raw, show)
-        metrics = self._metrics(track, joints, names, t)
+        position = self._position_of(track, raw_position)
+        metrics = self._metrics(track, joints, names, position, t)
         trail = np.asarray(track.trail, dtype=np.float32).reshape(-1, 3)
         # 漏检的轨迹：2D 关键点已经过期，别画（框留着，好看出"人刚刚还在这"）
         kpt_conf = track.kpt_conf if track.missed == 0 else np.zeros(NUM_KP, dtype=np.float32)
@@ -451,7 +462,7 @@ class PersonTracker:
             joints=joints,
             names=names,
             strips=strips,
-            position=self._position_of(track, raw_position),
+            position=position,
             velocity=np.asarray(track.velocity, dtype=np.float32).copy(),
             speed=track.speed,
             speed_ground=track.speed_ground,
@@ -461,12 +472,20 @@ class PersonTracker:
             missed=track.missed,
             valid_count=int(np.count_nonzero(show)),
             state_speed=self.metrics.speed_deadband,
+            fall_level=track.fall.level,
+            fall_state=track.fall.state_name,
+            fall_since=track.fall.since,
+            lying=track.fall.lying,
         )
 
-    def _metrics(self, track: _Track, joints, names, t: float) -> dict[str, float]:
-        """本帧的人体指标：尺寸（真深度）+ 步态 + 速度。缺项的就不出键。"""
+    def _metrics(
+        self, track: _Track, joints, names, position: np.ndarray, t: float
+    ) -> dict[str, float]:
+        """本帧的人体指标：摔倒状态 + 尺寸（真深度）+ 步态 + 速度。缺项的不出键。"""
         config = self.metrics
         out: dict[str, float] = {}
+        fall = self._update_fall(track, joints, names, position, t)
+        out.update(fall)
         if not config.enabled:
             return out
         out.update(
@@ -499,6 +518,39 @@ class PersonTracker:
                 if np.isfinite(cadence) and cadence > 0:
                     out["cadence"] = cadence  # 步/分钟
                     out["stride"] = track.speed_ground * 60.0 / cadence  # 米/步
+        return out
+
+    def _update_fall(self, track: _Track, joints, names, position, t: float) -> dict[str, float]:
+        """跑一帧摔倒状态机，返回要记录的曲线值（torso_angle / fall_level）。
+
+        信号都是实测的：高度 = 躯干中心沿"上"方向的分量（髀中点优先，见
+        ``pose3d.person_position``），竖直速度 = 位置卡尔曼的速度状态向"上"投影。
+        躺着时关键点常被遮，所以角度测不到就给 nan，靠高度兜底判据。
+        """
+        detector = track.fall
+        if not detector.config.enabled:
+            return {}
+        hip = joint_of(joints, names, "left_hip")
+        hip_r = joint_of(joints, names, "right_hip")
+        shoulder = joint_of(joints, names, "left_shoulder")
+        shoulder_r = joint_of(joints, names, "right_shoulder")
+        angle = float("nan")
+        if (
+            hip is not None
+            and hip_r is not None
+            and shoulder is not None
+            and shoulder_r is not None
+        ):
+            torso = (shoulder + shoulder_r) * 0.5 - (hip + hip_r) * 0.5
+            angle = torso_angle(torso, self.up)
+        height = float("nan")
+        if position is not None and np.isfinite(position).all():
+            height = float(np.asarray(position, np.float64) @ self.up)
+        v_down = -float(np.asarray(track.velocity, np.float64) @ self.up)
+        detector.update(t, height=height, v_down=v_down, angle=angle)
+        out: dict[str, float] = {"fall_level": float(detector.level)}
+        if np.isfinite(detector.angle):
+            out["torso_angle"] = float(detector.angle)
         return out
 
     # ------------------------------------------------------------------ 入口

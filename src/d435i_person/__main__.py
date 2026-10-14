@@ -31,6 +31,7 @@ from .config import (
     load_settings,
     resolve_path,
 )
+from .fall import FallConfig
 from .geometry import pointcloud
 from .track import MetricsConfig, PersonTracker
 from .world import CameraToWorld
@@ -196,6 +197,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖 [rerun].metrics_layout：格子/一框一行/全塞回一个框",
     )
     p.add_argument(
+        "--fall",
+        dest="fall_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [fall].enabled：开不开摔倒检测（默认开）",
+    )
+    p.add_argument(
         "--metrics",
         dest="metrics_enabled",
         action=argparse.BooleanOptionalAction,
@@ -308,6 +316,13 @@ def _person_record(person, world: CameraToWorld | None) -> dict:
         "speed": round(float(person.speed_ground), 4),
         "state": person.state,
         "velocity": [round(float(v), 4) for v in person.velocity],
+        # 摔倒状态：level 0 正常 / 1 疑似（有冲击、正在倒地）/ 2 摔倒（报警）
+        "fall": {
+            "level": int(getattr(person, "fall_level", 0)),
+            "state": getattr(person, "fall_state", ""),
+            "lying": bool(getattr(person, "lying", False)),
+            "since": getattr(person, "fall_since", None),
+        },
         # 人体尺寸/步态：身高/肩宽/髀宽/腿长/步频/步幅…缺项的键不会出现
         "metrics": {key: round(float(value), 4) for key, value in person.metrics.items()},
         "box": [round(float(v), 2) for v in person.box],
@@ -459,6 +474,18 @@ def main(argv: list[str] | None = None) -> int:
             height_min=settings.height_min,
             height_max=settings.height_max,
             stand_cos=settings.stand_cos,
+            fall=FallConfig(
+                enabled=settings.fall_enabled,
+                impact_speed=settings.fall_impact_speed,
+                drop_height=settings.fall_drop_height,
+                impact_window=settings.fall_impact_window,
+                lying_angle=settings.fall_lying_angle,
+                lying_height=settings.fall_lying_height,
+                lying_time=settings.fall_lying_time,
+                confirm_window=settings.fall_confirm_window,
+                recover_angle=settings.fall_recover_angle,
+                recover_time=settings.fall_recover_time,
+            ),
         ),
     )
 

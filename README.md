@@ -1,6 +1,7 @@
 # d435i-person-py
 
-Intel RealSense **D435i** → YOLO 姿态估计 → **真深度 3D 骨架** → 跟踪 ID/轨迹/世界坐标 →
+Intel RealSense **D435i** → YOLO 姿态估计 → **真深度 3D 骨架** → 跟踪 ID/轨迹/世界坐标/人体指标
+（速度·身高·肩宽·步频…）+ **摔倒检测** →
 [Rerun](https://rerun.io) 可视化。取流直接用 `pyrealsense2`。
 
 **参数都在 [`config.toml`](config.toml) 里，代码里不写死。** 命令行只做临时覆盖。
@@ -31,8 +32,8 @@ uv run d435i-person --show-config        # 打印合并后的生效参数
 uv run d435i-person                      # 按 config.toml 跑（开 rerun 窗口）
 uv run d435i-person --duration 30        # 临时覆盖某一项
 uv run d435i-person --weights models/yolo26n-pose.pt --detect-hz 60   # n 模型可以真跑到 60 Hz
-uv run d435i-person --coords-view --count-view                          # 坐标表 + 人数曲线都要
-uv run d435i-person --count-view --no-coords-view                       # 只要人数曲线（旧布局）
+uv run d435i-person --metrics-views fall                      # 只看摔倒那两条曲线
+uv run d435i-person --no-fall                                 # 关掉摔倒检测
 uv run d435i-person --no-rerun --max-frames 300        # 只看结果，不开窗口不写文件
 uv run d435i-person --world --world-height 1.35 --world-pitch 20   # 打开世界坐标系
 uv run python tools/check_camera.py --save out/        # 不跑模型的相机自检
@@ -93,6 +94,13 @@ speed_deadband = 0.15         # 低于它当"静止"（只影响显示与状态�
 gait_window = 4.0             # 步频统计窗口（秒）
 walk_speed = 0.25             # 地面速度超过它才计步
 head_offset = 0.12            # 鼻 -> 头顶补偿（米），不补身高会系统性低估 ~7%
+
+[fall]
+enabled = true                # 摔倒检测（不受 [metrics].enabled 影响）
+impact_speed = 1.0            # m/s：向下速度超过它算冲击
+lying_angle = 60.0            # 度：躯干与"上"夹角超过它算躺倒
+lying_time = 1.2              # s：躺倒连续这么久才确认报警
+recover_time = 1.0            # s：直立保持这么久才解除
 
 [points]
 enabled = true                # 彩色点云
@@ -232,6 +240,45 @@ JSON Lines 里每人也多一个 `world` 字段。
    导数化还是会带出 ±0.4 m/s 抖动；不平滑就会看到速度在 0 和 1 之间乱跳。
    想要"起步瞬间"响应更快就把 tau 调小（代价是曲线抄噪）。
 
+## 摔倒检测
+
+`[fall]` 段控制（默认开），状态机在 `fall.py`。三步判据，**缺一步都不报警**：
+
+| 步 | 信号 | 为什么这么定 |
+| --- | --- | --- |
+| 1 冲击 | 向下速度 ≥ `impact_speed`(1.0 m/s)，或 `impact_window`(0.7 s) 内从窗口高点掉了 `drop_height`(0.35 m) | 真深度测的是真位移，“0.4 m 只用了 0.3 s”这种判据是实测的；速度滤波滞后时靠位移兼底 |
+| 2 躺倒 | 躯干与"上"方向夹角 ≥ `lying_angle`(60°)；角度测不到时用"比站立参考低 `lying_height`(0.35 m)"兼底 | 躺着时关键点常被床/腿挡住；站立参考是自动学的（只在正常+直立时更新的 EMA），不用量相机多高 |
+| 3 持续 | 躺倒连续 `lying_time`(1.2 s) 秒，且必须在冲击后 `confirm_window`(3 s) 内 | 把“快速蹲一下又起来”排掉 |
+
+报警后要**直立保持 `recover_time`(1 s)** 才解除（人爬起来的过程中不闪烁）。状态：
+`0 正常` / `1 疑似`（有冲击或正在倒地）/ `2 摔倒`（报警）。
+
+合成骨架端到端验证（2D 投影 → 深度采样 → 3D 提升 → 卡尔曼 → 状态机，摔倒在 t=4.0 s）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 站 4 s → 0.45 s 摔倒 → 躺着 | t=4.33 疑似（躯干 52°、已下沉 0.38 m）→ **t=5.67 报警**（躯干 89.6°、高度 -0.94 m）|
+| 慢慢躺下（4 s，无冲击）| 不报警 ✓ |
+| 快速蹲下（0.5 m/0.35 s，躯干始终 28°）| 只到“疑似”，起身后回正常 ✓ |
+| 弯腰捡东西（躯干 75° 但只下沉 0.3 m 且慢）| 不报警 ✓ |
+| 摔倒后角度测不到（被床挡住）| 靠高度兼底仍报警 ✓ |
+| 原地跳（落地冲击、躯干直立）| 只到“疑似”，不报警 ✓ |
+
+报警长什么样：
+
+- **人变红**：2D 框/关键点/骨骰与 3D 位置、轨迹都换 `ALARM_COLOR`（比“去某个框里找条线”快）
+- 数值行首部插 `⚠ 摔倒`（确认前只是“倒地中”；仅挨一下冲击的正常动作不插）
+- `person/metrics/fall/fall_level/<id>` 与 `torso_angle/<id>` 两条曲线，`person/fall` 记状态变化的文本日志
+
+已知边界（写在模块 docstring 里，不藏）：
+**主动快速躺到地上会报警**（速度和姿态与摔倒根本分不开）；**被人抱起来搬走可能误报**。
+这类只能靠报警后人工确认，本模块只负责报，不做抑制。
+
+```bash
+uv run d435i-person --no-fall              # 关掉摔倒检测
+uv run d435i-person --metrics-views fall   # 只看摔倒那两条曲线
+```
+
 ## 可视化（rerun）
 
 | 实体 | 内容 |
@@ -245,7 +292,7 @@ JSON Lines 里每人也多一个 `world` 字段。
 | `camera/pose3d/joints` `skeleton` | 真深度 3D 骨架 |
 | `camera/pose3d/trails` `positions` | 轨迹、每人 3D 位置（短标签带距离与速度） |
 | `world/...` | 世界系视图（`[world].enabled` 时才记） |
-| `person/metrics/<组>/<指标>/<id>` | **人体指标曲线**，按组拆框：`speed` 速度、`size` 高/肩/髀、`length` 躯干/腿/臂展、`gait` 步频/步幅、`quality` coverage |
+| `person/metrics/<组>/<指标>/<id>` | **人体指标曲线**，按组拆框：`speed` 速度、`size` 高/肩/髀、`length` 躯干/腿/臂展、`gait` 步频/步幅、`fall` 摔倒（躯干角/等级）、`quality` coverage |
 | `person/values` | 每人一行极简数值（短文本，见下方"数值行"） |
 | `person/coords/<id>/{x,y,z}` | 坐标曲线（相机系，默认关） |
 | `person/count` | 人数标量（数据一直在，只是默认不占面板） |
@@ -263,6 +310,7 @@ JSON Lines 里每人也多一个 `world` 字段。
 | `size` | `height`、`shoulder_width`、`hip_width` |
 | `length` | `torso`、`leg`、`arm_span` |
 | `gait` | `cadence`、`stride` |
+| `fall` | `fall_level`（0/1/2）、`torso_angle`（度）|
 | `quality` | `coverage`（有效关节比例，可信度自检） |
 
 ```bash
@@ -299,6 +347,7 @@ uv run d435i-person --metrics-layout single        # 回到“一个大框全在
  "people": [{"id": 3, "conf": 0.87, "distance": 2.31, "cam": [0.12, -0.05, 2.31],
              "world": [0.31, -0.12, 1.10],
              "speed": 0.41, "state": "行走", "velocity": [-0.02, 0.01, 0.41],
+             "fall": {"level": 0, "state": "", "lying": false, "since": null},
              "metrics": {"coverage": 1.0, "torso": 0.58, "leg": 0.79, "height": 1.71,
                           "shoulder_width": 0.40, "hip_width": 0.30, "arm_span": 0.62,
                           "speed": 0.41, "speed_ground": 0.41, "cadence": 106.2,
@@ -307,7 +356,9 @@ uv run d435i-person --metrics-layout single        # 回到“一个大框全在
              "valid_keypoints": 14, "age": 96}]}
 ```
 
-`world` 只在 `[world].enabled` 时非 null。`speed` 是**地面速度**（垂直于上方向的分量，
+`world` 只在 `[world].enabled` 时非 null。`fall.level` 是 0 正常 / 1 疑似 / 2 摔倒
+（`since` 是进入当前状态的时刻，报警后就是摔倒发生的时间）；`lying` 是本帧是否躺倒姿态。
+`speed` 是**地面速度**（垂直于上方向的分量，
 m/s），`velocity` 是相机系速度矢量，`state` 是静止/行走。`metrics` 里缺哪个指标
 （关节被挡、深度没测到、或身高不满足直立体态）就少哪个键。
 `--save-dir` 另存标注图（按需 `annotate()`，不是每帧都画）。
@@ -358,6 +409,7 @@ d435i-person-py/
 | 可视化记录（JPEG 编码 + 深度/点云/骨架/坐标） | 3.8 ms | 3.8 ms | 3.8 ms |
 | 跟踪 + 3D（1 人；17 点 5×5 中值取深度 + 51 个卡尔曼） | 0.87 ms | 0.87 ms | 1.2 ms |
 | 人体指标（速度/步态/尺寸，1 人） | +0.17 ms | +0.17 ms | +0.2 ms |
+| 摔倒检测（状态机，1 人） | +0.002 ms | +0.002 ms | +0.01 ms |
 | 点云（stride 4，1.92 万点） | 0.43 ms | 0.43 ms | 0.6 ms |
 | 全链路（1 人） | ~9.6 ms | ~14.9 ms | ~70 ms |
 | 能达到的端到端上限 | ~104 fps | ~67 fps | **~14 Hz** |
@@ -400,6 +452,9 @@ uv run python tools/check_camera.py --frames 60              # 只看相机侧�
 | 身高数字一跳一跳 | 关键点在头/踝处不够稳（头发、裙摆、地面阴影）；把 `[metrics].height_min/max` 收紧，或看 `coverage` 曲线判断哪些帧不可信 |
 | 相机设了 60 fps，但日志只有 15 fps 端到端 | 正常：`detect_hz` 是按模型能力设的，x 模型 64.5 ms/帧。想要 60 Hz 推理换 n（`--weights models/yolo26n-pose.pt --detect-hz 60`）；日志里的"X 帧跳推理"就是为它丢的帧 |
 | 启动报 `Couldn't resolve requests`（60 fps 时） | 某些固件/机型下彩色 60 fps 只支持特定格式：本机 640x480 的 RGB8/BGR8/YUYV 都支持 @60，1280x720 只有 @30/15/6 |
+| 摔倒报警太容易触发 | 调大 `[fall].impact_speed` / `lying_time`，或调小 `lying_angle`（要更“横”才算躺）；先把 `--no-fall` 关了对照看是哪个判据在报（`torso_angle` 与 `fall_level` 两条曲线一看就知道）|
+| 摔倒没报 | 先确认 `[fall].enabled`（`--show-config | grep fall`）；人得站得比较完整（高度兼底判据需先学到站立参考，开跑前几秒得是站着的）；真躺着但没位移/速度（被人慢慢放下）本质上报不了 |
+| “疑似摔倒”一直亮着 | 人在持续跳/快速蹲起时会出现（只到 1 级、不报警）；不想要这个显示就把 `fall_alert()` 里那一支去掉 |
 | 右上角看不到坐标/指标曲线 | 坐标曲线需 `[rerun].show_coords = true`（默认关）；指标曲线看 `show_metrics` 与 `metrics_views` |
 | 指标框太多/太空（不走路就没步态曲线） | `--metrics-views speed,size` 只留要看的组，或 `--metrics-layout single` 换回一个大框 |
 | 3D 骨架"呼吸"/抖 | 提高 `[pose3d].kalman_measurement`（更平滑），或开 `--temporal` 深度滤镜 |

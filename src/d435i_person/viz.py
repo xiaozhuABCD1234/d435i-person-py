@@ -16,11 +16,12 @@
 ``camera/pose3d/positions``          每个人的 3D 位置（标签 = id + 距离）
 ``world/...``                       世界系 3D 视图根（RIGHT_HAND_Z_UP，可选）
 ``world/{points,joints,skeleton,trails,positions}``  世界系副本（刚体变换后）
-``person/metrics/<组>/<指标>/<id>``  人体指标曲线（按组拆框：速度/尺寸/长度/步态/可信度）
-``person/values``                    极简数值行（每人一行短文本）
+``person/metrics/<组>/<指标>/<id>``  人体指标曲线（按组拆框：速度/尺寸/长度/步态/摔倒/可信度）
+``person/values``                    极简数值行（每人一行短文本，报警时带 ⚠ 摔倒）
 ``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米，默认关）
 ``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
+``person/fall``                      摔倒状态变化日志（只在跳变时记一条）
 ===================================  =======================================
 
 右上角默认是**按组拆开的指标曲线框**（速度 / 尺寸 / 长度 / 步态 / 可信度，用
@@ -56,11 +57,31 @@ PALETTE: tuple[tuple[int, int, int], ...] = (
 )
 POSITION_RADIUS = 0.04  # 米：3D 位置球半径
 JOINT_RADIUS = 0.02  # 米：关节球半径
+ALARM_COLOR = (255, 64, 64)  # 摔倒报警色（2D/3D 都换成它，比“看曲线”快得多）
 
 
 def color_for(person_id: int) -> tuple[int, int, int]:
     """同一个 id 永远同一个颜色（id 从 1 开始，单调递增）。"""
     return PALETTE[(int(person_id) - 1) % len(PALETTE)]
+
+
+def person_color(person) -> tuple[int, int, int]:
+    """报警时整个人变红：视觉上比“某个框里多一条线”快得多。"""
+    return ALARM_COLOR if getattr(person, "fall_level", 0) >= 2 else color_for(person.id)
+
+
+def fall_alert(person) -> str:
+    """数值行里的摔倒标注：确认了才写“⚠ 摔倒”（带躯干角，方便一眼判断是不是真的躺下了），
+    只是倒地中的写“倒地中”，仅挨一下冲击（跳、快速蹲下）不写——别把正常动作显示成警报。"""
+    level = getattr(person, "fall_level", 0)
+    if level >= 2:
+        angle = person.metrics.get("torso_angle")
+        if angle is not None and np.isfinite(angle):
+            return f"⚠ 摔倒 {angle:.0f}°"
+        return "⚠ 摔倒"
+    if level == 1 and getattr(person, "lying", False):
+        return "倒地中"
+    return ""
 
 
 # 极简数值行的字段顺序与单位（键 -> (短标签, 单位, 小数位)）
@@ -80,6 +101,7 @@ METRIC_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("size", "尺寸（高/肩/髀）", ("height", "shoulder_width", "hip_width")),
     ("length", "长度（躯干/腿/臂展）", ("torso", "leg", "arm_span")),
     ("gait", "步态（步频/步幅）", ("cadence", "stride")),
+    ("fall", "摔倒（躯干角/等级）", ("torso_angle", "fall_level")),
     ("quality", "可信度", ("coverage",)),
 )
 
@@ -124,6 +146,9 @@ def _parse_metric_views(spec: str | None) -> list[tuple[str, str, str]]:
 def value_line(person) -> str:
     """一个人一行短文本：只列本帧真有的指标，不占地方也看不到 nan。"""
     parts = [f"#{person.id}"]
+    alert = fall_alert(person)
+    if alert:
+        parts.append(alert)
     if np.isfinite(person.distance):
         parts.append(f"距 {person.distance:.2f} m")
     if np.isfinite(person.speed_ground):
@@ -210,6 +235,7 @@ class RerunView:
         self._image_size: tuple[int, int] | None = None
         self._coords_logged: set[str] = set()
         self._styled_series: set[str] = set()  # 已经声明过颜色的曲线（只声明一次）
+        self._fall_levels: dict[int, int] = {}  # 每个人的摔倒等级，用于只在跳变时记事件
 
         rr.init(app_id, spawn=False)
         if save_path:
@@ -419,6 +445,7 @@ class RerunView:
                     f"{count} person(s): " + ", ".join(f"#{d.id} conf={d.conf:.2f}" for d in live)
                 ),
             )
+        self._log_fall_events(live)
 
         # 标量一直带时间戳（曲线靠它们画）：人数、人体指标、以及每个人的位置坐标。
         self._set_time(number)
@@ -457,7 +484,7 @@ class RerunView:
                 centers=centers,
                 sizes=sizes,
                 labels=[person.label for person in people],
-                colors=[color_for(person.id) for person in people],
+                colors=[person_color(person) for person in people],
             ),
         )
 
@@ -470,7 +497,7 @@ class RerunView:
         strips: list[np.ndarray] = []
         strip_colors: list[tuple[int, int, int]] = []
         for person in people:
-            color = color_for(person.id)
+            color = person_color(person)
             visible, names = visible_keypoints(
                 person.keypoints2d, person.kpt_conf, threshold=self.kpt_conf
             )
@@ -492,6 +519,27 @@ class RerunView:
             ),
         )
         self._log("camera/image/skeleton", rr.LineStrips2D(strips, colors=strip_colors))
+
+    def _log_fall_events(self, live) -> None:
+        """摔倒状态一变就记一条 TextLog（rerun 的文本日志面板里能看到整串时间线）。
+
+        只在跳变时记，不是每帧都记：报警从“倒地中”到“摔倒”再到“已恢复”一共就几条。
+        """
+        rr = self.rr
+        for person in live:
+            level = int(getattr(person, "fall_level", 0))
+            if level == self._fall_levels.get(person.id, 0):
+                continue
+            self._fall_levels[person.id] = level
+            angle = person.metrics.get("torso_angle")
+            detail = f"（躯干 {angle:.0f}°）" if angle is not None and np.isfinite(angle) else ""
+            if level >= 2:
+                text = f"⚠ #{person.id} 检测到摔倒{detail}"
+            elif level == 1:
+                text = f"#{person.id} 疑似摔倒 / 倒地中{detail}"
+            else:
+                text = f"#{person.id} 已恢复正常"
+            self._log("person/fall", rr.TextLog(text))
 
     def _log_values(self, live) -> None:
         """极简数值行：每人一行短文本（距/速/身高/肩宽/髀宽/步频/步幅）。
@@ -561,7 +609,7 @@ class RerunView:
         position_colors: list[tuple[int, int, int]] = []
 
         for person in people:
-            color = color_for(person.id)
+            color = person_color(person)
             if len(person.joints):
                 joints.append(np.asarray(person.joints, dtype=np.float32))
                 labels.extend(f"#{person.id} {name}" for name in person.names)
@@ -574,11 +622,14 @@ class RerunView:
                 trail_colors.append(color)
             if np.isfinite(person.position).all():
                 positions.append(np.asarray(person.position, dtype=np.float32))
+                alert = fall_alert(person)
                 position_labels.append(
                     f"#{person.id} {person.distance:.2f} m · {person.speed_ground:.2f} m/s"
                     if np.isfinite(person.speed_ground)
                     else f"#{person.id} {person.distance:.2f} m"
                 )
+                if alert:
+                    position_labels[-1] = f"{position_labels[-1]} · {alert}"
                 position_colors.append(color)
 
         self._log(

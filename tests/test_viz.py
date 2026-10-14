@@ -12,7 +12,15 @@ from d435i_person.camera import Frame
 from d435i_person.geometry import Intrinsics, pointcloud
 from d435i_person.pose import NUM_KEYPOINTS, PoseInstance
 from d435i_person.track import PersonTracker
-from d435i_person.viz import PALETTE, RerunView, color_for
+from d435i_person.viz import (
+    ALARM_COLOR,
+    PALETTE,
+    RerunView,
+    color_for,
+    fall_alert,
+    person_color,
+    value_line,
+)
 from d435i_person.world import CameraToWorld
 
 K = Intrinsics(fx=500.0, fy=500.0, cx=320.0, cy=240.0, width=640, height=480)
@@ -60,6 +68,27 @@ def test_color_for_is_stable_and_wraps_around() -> None:
     assert color_for(1) != color_for(2)
     assert color_for(1) == PALETTE[0]
     assert color_for(len(PALETTE) + 1) == PALETTE[0]
+
+
+def test_fallen_person_turns_red_and_is_flagged() -> None:
+    """摔倒：整体换警报色（比“去曲线框里找线”快得多），数值行带 ⚠ 与躯干角。"""
+    person = make_people()[0]
+    assert person_color(person) == color_for(person.id)
+    assert fall_alert(person) == ""
+
+    person.fall_level, person.lying = 1, True  # 倒地中（还没确认）
+    assert fall_alert(person) == "倒地中"
+    assert person_color(person) == color_for(person.id)
+
+    person.fall_level = 1  # 只是挨了一下冲击（跳、快速蹲下）就不标注
+    person.lying = False
+    assert fall_alert(person) == ""
+
+    person.fall_level = 2
+    person.metrics["torso_angle"] = 88.6
+    assert fall_alert(person) == "⚠ 摔倒 89°"
+    assert person_color(person) == ALARM_COLOR
+    assert "⚠ 摔倒" in value_line(person)
 
 
 def test_log_frame_writes_an_rrd(tmp_path: Path) -> None:
