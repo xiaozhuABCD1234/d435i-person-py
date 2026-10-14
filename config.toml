@@ -1,0 +1,169 @@
+# d435i-person 参数文件
+#
+# 优先级：命令行 > 本文件 > 代码里的兜底默认值。
+# 未知键名会被警告（不会静默忽略），类型不对也会警告并忽略该项。
+# 命令行想临时覆盖就见 `uv run d435i-person --help`。
+
+[camera]
+# 本机 D435i；用 `uv run d435i-person --list` 看所有可选设备。
+# 留空 = 用 index 指定的那一台（多相机时必须用 serial 指认，否则谁先枚举到就用谁）。
+serial = ""
+index = 0
+
+# 分辨率/帧率。两路都开，深度会被对齐到彩色视角（对齐后深度分辨率 = 彩色分辨率）。
+# 可选值见 `rs-enumerate-devices -c`：D435i 深度 640x480/848x480 都支持
+# @90/60/30/15/6，彩色 640x480/848x480/1280x720 @60/30/15/6。
+# 60 fps 时 USB3 带宽会被占掉更多，按需调；30 fps 是稳妥的默认。
+color_size = "640x480"
+depth_size = "640x480"
+fps = 30
+
+# 曝光/增益：
+#   "sdk"    = 用相机自己的自动曝光 + 自动增益（默认，推荐）
+#   "manual" = 固定用下面的 exposure_us / gain
+exposure_mode = "sdk"
+
+# manual 模式的曝光（us）/ 增益：0 = 用设备当前值。
+# 注意 D435i 的 Gain 不是 dB，是 sensor 的内部单位（典型范围 16-248）。
+exposure_us = 0.0
+gain = 0.0
+
+# sdk 模式写彩色 sensor 的 Brightness（AE 的目标亮度，典型 0-255）；-1 = 不动它。
+# 默认不动：D435i 的 AE 出厂表现已经够稳，写错反而会压暗画面（hik 那台相机是
+# 必须先放开曝光上限再压增益，D435i 没这个问题）。
+brightness = -1.0
+
+# 红外发射器（1 开 / 0 关）与激光功率（典型 0-360）。
+# 关发射器 = 没有 IR 结构光，深度在无纹理面上会大面积空洞，只在多相机互相干扰时才关。
+# -1 一律表示"不动这项"（用设备当前值）。
+laser_power = -1.0
+emitter_enabled = -1
+
+# 深度的视觉预设：-1 = 不动；D435i 常见 1=Default 2=High Accuracy 3=High Density
+# 4=Medium Density（具体编号用 `rs-enumerate-devices -c` 或 viewer 里的下拉框确认）。
+depth_preset = -1
+
+# 取一帧的等待上限（毫秒）。低于相机帧间隔会开始丢帧。
+read_timeout_ms = 5000
+
+[filters]
+# 深度的后处理滤镜。默认全关：D435i 原生深度对关键点已经够用，滤镜会模糊边缘、
+# 让关节处的深度变"糊"，开之前先在 rerun 里对比 [pose3d] 的效果。
+# 另外 decimation 会改变深度分辨率（内参和 3D 全得跟着重算），本包不启用，
+# 点云用 [points].stride 抽稀代替。
+spatial = false
+temporal = false
+hole_filling = false
+
+[detector]
+# 本包只做 pose（骨架）；换模型只改这一行。相对路径按项目根解析。
+# 想只数人头、不需要骨架：把 conf 调高、imgsz 调小即可，pose 模型一样出框。
+weights = "models/yolo26n-pose.pt"
+conf = 0.35
+imgsz = 640
+# "" = 有 CUDA 用 cuda:0，否则 cpu。
+device = ""
+# 关键点置信度低于它就当没看见（2D 骨架、3D 骨架、有效关键点计数都受影响）。
+kpt_conf = 0.5
+
+[run]
+# 推理与可视化频率（相机更快时多余帧只取流不推理）。
+detect_hz = 15.0
+# 限速容忍：帧到达时刻正好压在周期边界上时靠它避免白丢一半的帧（实测 15/15、30/15 都会）。
+rate_tolerance = 0.9
+# 跑够 duration 秒或 max_frames 帧后退出；0 = 不限。
+duration = 0.0
+max_frames = 0
+# 检测到人时存标注图（模型画的框/骨架）。
+save_dir = ""
+save_min_interval = 1.0
+
+[output]
+# 非空则把每帧的人写成 JSON Lines（追加），每行：
+#   {"t":..., "frame":..., "count":..., "people":[{"id","conf","distance","cam","world","box",...}]}
+# 相对路径按项目根解析。下游接 ROS/机器人/日志分析都从这里取。
+jsonl = ""
+hz = 5.0
+
+[rerun]
+enabled = true
+# 默认纯显示：不写任何文件。非空才写 .rrd 且不弹窗口（调试/无桌面时才用）。
+save = ""
+
+# false（默认）= 图像/点云/骨架用 static 记录：viewer 只保留最新一份，没有时间轴可回拖，
+# 内存不随帧数涨。true = 带时间戳、可回拖，但内存一直涨。
+keep_history = false
+
+# 兼底硬上限（到顶丢最旧数据）；rerun 自己的默认是 75%（本机约 23 GB）。
+memory_limit = "512MB"
+server_memory_limit = "512MB"
+# 图像送进 viewer 前先压成 JPEG（质量 1-100，0 = 不压原图）。
+# 640×480 原图每帧 0.92 MB，压成 JPEG(75) 后约 0.05 MB。
+jpeg_quality = 75
+# viewer 的端口；被占用时 rerun 会直接拿来用。
+port = 9876
+
+[pose3d]
+# 整个 3D 链路的总开关：关掉后不记 3D 骨架/轨迹/点云/深度图，也不输出世界坐标，
+# 只留 2D（人照样带 id）——想省 viewer 内存或只看检测框时用 --no-pose3d。
+enabled = true
+
+# 3D 关键点的卡尔曼滤波（每个人的每个关键点一个恒定速度滤波，平滑深度抖动）。
+kalman = true
+# 过程噪声（加速度，m/s²）：越大越跟手、越不平滑。
+kalman_process = 10.0
+# 观测噪声（m）：越大越平滑（越信历史、越不信当前观测）。
+# D435i 的真深度比 hik 的单目深度稳得多，所以这里的 r 比 hik 小一个量级。
+kalman_measurement = 0.02
+
+# 左列下面再放一块对齐深度图（Turbo 伪彩，悬停看米数）。
+depth_view = true
+
+# 固定 3D 视角（相机坐标系，米）：eye=眼位，look_at=看向的点，eye_up=上方向。
+# 不固定的话 rerun 会按数据包围盒自动取景，深度/点云逐帧变化，画面会一直"自动缩放"。
+# 想换视角就改这三个数（Y 向下，所以上方向是 -Y）；viewer 里仍可鼠标拖。
+eye = [0.0, 0.0, -1.5]
+look_at = [0.0, 0.0, 2.5]
+eye_up = [0.0, -1.0, 0.0]
+
+[track]
+# 跨帧关联（IoU 贪心配对）与 id：
+# 配对上的沿用同一个 id，配不上的新建轨迹，连续漏检超过 max_missed 帧才删。id 单调
+# 递增、永不复用。IoU 门限定得越高越容易"换人"，越低越容易把两个人并成一个。
+iou_threshold = 0.3
+# >0 时配对还要满足 3D 距离不超过这个值（米），防止两人交叉/擦肩时换 id；0 = 只看 IoU。
+match_max_distance = 0.0
+# 轨迹删掉前允许漏检多少帧（15 Hz 推理下 5 帧 ≈ 0.33 s）。
+max_missed = 5
+# 单个关键点连续漏检多少帧后不再画（人的其他部位继续画）。
+max_missed_kpt = 3
+# 轨迹点数上限与采样间隔（秒）。0 长度 = 不留轨迹。
+trail_length = 300
+trail_interval = 0.1
+
+[points]
+# 彩色点云（相机坐标系，米）。D435i 现成的能力，比 hik 只有单目深度图实在得多。
+enabled = true
+# 点云频率（Hz）。640×480 stride 4 约 1.9 万点，10 Hz 足够看清结构。
+hz = 10.0
+# 像素抽稀步长：4 -> 约 1.9 万点（16 万点全发会明显吃 viewer 内存）。
+stride = 4
+# 只保留这个距离范围内的点（米）。D435i 在 0.3-3 m 最准，远处噪声大。
+max_distance = 4.0
+min_distance = 0.05
+
+[world]
+# 世界系（地面系）坐标：把人的位置从相机系换算到一个"相机正下方的地面点"为原点的
+# 坐标系（X 前 / Y 左 / Z 上，照 ROS REP-103 的习惯）。只需要一个静态外参，不用标定板。
+#
+# 默认关：不知道安装高度/俯仰角时，开出来的世界坐标是错的，不如只用相机系。
+# 量一下装多高、镜头往下俯了几度，填进来再开。
+enabled = false
+height = 1.0        # 光心离地高度（米）
+pitch_deg = 0.0     # 镜头下俯角度（正 = 向下；0 = 完全水平）
+yaw_deg = 0.0       # 绕世界 Z 轴左转为正
+roll_deg = 0.0
+
+# 世界系视图里也放一份点云（刚体变换后）以及是否在 rerun 里加这个世界系 3D 视图。
+pointcloud = true
+view = true
