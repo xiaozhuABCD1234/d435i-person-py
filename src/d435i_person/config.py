@@ -51,7 +51,7 @@ class Settings:
     hole_filling: bool = False
 
     # -------------------------------------------------------------- [detector]
-    weights: str = "models/yolo26n-pose.pt"
+    weights: str = "models/yolo26m-pose.pt"  # 兜底默认；正常参数写在 config.toml
     conf: float = 0.35
     imgsz: int = 640
     device: str = ""

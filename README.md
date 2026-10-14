@@ -30,6 +30,7 @@ uv run d435i-person --list               # 枚举 RealSense 设备
 uv run d435i-person --show-config        # 打印合并后的生效参数
 uv run d435i-person                      # 按 config.toml 跑（开 rerun 窗口）
 uv run d435i-person --duration 30        # 临时覆盖某一项
+uv run d435i-person --weights models/yolo26n-pose.pt   # 临时换小模型（快一倍）
 uv run d435i-person --no-rerun --max-frames 300        # 只看结果，不开窗口不写文件
 uv run d435i-person --world --world-height 1.35 --world-pitch 20   # 打开世界坐标系
 uv run python tools/check_camera.py --save out/        # 不跑模型的相机自检
@@ -62,7 +63,7 @@ temporal = false
 hole_filling = false
 
 [detector]
-weights = "models/yolo26n-pose.pt"   # 只做 pose；相对路径按项目根解析
+weights = "models/yolo26m-pose.pt"   # 只做 pose；相对路径按项目根解析（见下方"模型选择"）
 conf = 0.35
 imgsz = 640
 kpt_conf = 0.5                # 关键点置信度阈值（2D/3D 骨架、有效点计数都受影响）
@@ -117,6 +118,31 @@ X = (u - cx) * Z / fx     Y = (v - cy) * Z / fy     Z = depth
 关键点取深度用的是 **5×5 窗口中值**，不是单像素：关节正好压在人体/背景边界上时，
 单像素会被背景抢走，中值稳得多。窗口内没有有效值就是 nan，该关键点这一帧不算数
 （`valid_count` 会掉），骨头只在两端都有效时才画。
+
+## 模型选择
+
+默认 `models/yolo26m-pose.pt`（49 MB）。官方预训练都在 `ultralytics/assets` 的 release
+里，`YOLO("yolo26l-pose.pt")` 会自动下载到当前目录：
+
+```bash
+cd models && uv run python -c "from ultralytics import YOLO; YOLO('yolo26l-pose.pt')"
+```
+
+RTX 4060 Laptop、输入 640×480、`imgsz 640` 实测（`tools/bench.py --no-camera`，
+20 帧热身后再计 200 帧）：
+
+| 权重 | 大小 | YOLO pose | 相对 m 的速度 |
+| --- | --- | --- | --- |
+| `yolo26n-pose.pt` | 7.9 MB | 4.4 ms | 2.2× |
+| `yolo26s-pose.pt` | 24 MB | — | — |
+| **`yolo26m-pose.pt`（当前）** | 49 MB | **9.7 ms** | 1× |
+| `yolo26l-pose.pt` | 58 MB | — | — |
+| `yolo26x-pose.pt` | 126 MB | — | — |
+
+15 Hz 的检测预算是 66 ms，所以 m（9.7 ms）甚至 x 都塞得下：**瓶颈从来不在模型**，
+而在取流节奏（30 fps ≈ 33 ms/帧）和 viewer 的内存。真的想更准，优先级大致是：
+换大模型 → `imgsz 768`（关键点分辨率翻倍，代价约 1.4×）→ 调 `[detector].conf` /
+`kpt_conf`。
 
 ## 世界坐标怎么用
 
@@ -198,7 +224,7 @@ uv run python tools/bench.py             # 分阶段计时：取流/YOLO/跟踪/
 ```
 d435i-person-py/
 ├── config.toml                 全部参数（唯一的"旋钮面板"）
-├── models/yolo26n-pose.pt      YOLO pose 权重（与 hik-person-py 同一份）
+├── models/                     yolo26n-pose.pt（最快）、yolo26m-pose.pt（默认）
 ├── src/d435i_person/
 │   ├── __main__.py             CLI + 主循环（限速、点云/JSONL 的频率、存图）
 │   ├── config.py               参数读取/校验/命令行覆盖
@@ -216,24 +242,28 @@ d435i-person-py/
 
 ## 性能
 
-640×480×30 下，瓶颈基本全在 viewer 的内存/带宽，不在计算：所以默认
-`detect_hz = 15`、`points.hz = 10`、图像送 viewer 前压 JPEG。要更高频就
-`--detect-hz 30`（相机还跟得上），但别同时把 `--rerun-keep-history` 打开。
+实测（RTX 4060 Laptop、640×480×30、`imgsz 640`、`yolo26m-pose`、
+`tools/bench.py --no-camera --frames 220`，20 帧热身）：
 
-各阶段真实耗时用下面这条量（RTX 4060 Laptop 上 `yolo26n-pose` + `imgsz 640`
-的预期值在括号里，实测完请把这里换成真实数字）：
+| 阶段 | 实测 |
+| --- | --- |
+| 取流 + 对齐 | 30 fps 上限 ≈ 33 ms/帧（相机节奏，不是计算） |
+| YOLO pose（m / n） | **9.7 ms** / 4.4 ms |
+| 跟踪 + 3D（1 人；17 点 5×5 中值取深度 + 51 个卡尔曼） | **0.95 ms**（每人线性增长，4 人 ≈ 3.4 ms） |
+| 点云（stride 4，1.92 万点） | **0.43 ms** |
+| 合计（m，1 人） | 11.1 ms → 计算侧上限约 90 fps |
+
+所以瓶颈永远是 viewer 内存/带宽与相机节奏，不是计算：默认 `detect_hz = 15`、
+`points.hz = 10`、图像送 viewer 前压 JPEG。要更高频就 `--detect-hz 30`，但别同时把
+`--rerun-keep-history` 打开。
+
+自己复现/换参数：
 
 ```bash
-uv run python tools/bench.py --frames 200        # 取流/YOLO/跟踪/点云 分阶段
-uv run python tools/check_camera.py --frames 60  # 只看相机侧帧率与深度质量
+uv run python tools/bench.py --frames 200                    # 分阶段（含相机）
+uv run python tools/bench.py --no-camera --weights models/yolo26n-pose.pt   # 不占相机比模型
+uv run python tools/check_camera.py --frames 60              # 只看相机侧帧率与深度质量
 ```
-
-| 阶段 | 预期 |
-| --- | --- |
-| 取流 + 对齐 | 30 fps 上限，即平均 ~33 ms 一帧（含等帧） |
-| YOLO pose | ~7 ms（待实测） |
-| 跟踪 + 3D（17 点反投影 + 卡尔曼） | ~1 ms（纯 numpy，量级可信） |
-| 点云（stride 4，约 1.9 万点） | ~1.5 ms（待实测） |
 
 ## 故障排查
 

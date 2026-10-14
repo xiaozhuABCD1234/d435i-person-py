@@ -63,7 +63,13 @@ def fake_pose() -> PoseInstance:
 def main() -> int:
     parser = argparse.ArgumentParser(description="d435i-person 分阶段计时")
     parser.add_argument("--frames", type=int, default=200)
-    parser.add_argument("--weights", default="models/yolo26n-pose.pt")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=20,
+        help="前多少帧不计时（CUDA 初始化/cuDNN 选算法都落在第一帧，不热身会把均值拉高）",
+    )
+    parser.add_argument("--weights", default="models/yolo26m-pose.pt")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.35)
     parser.add_argument("--device", default=None)
@@ -101,10 +107,16 @@ def main() -> int:
 
     try:
         for index in range(args.frames):
+            timed = index >= args.warmup
+
+            def lap(name: str, start: float, *, timed: bool = timed) -> None:
+                if timed:
+                    timer.add(name, time.perf_counter() - start)
+
             if camera is not None:
                 t0 = time.perf_counter()
                 frame = camera.read()
-                timer.add("取流+对齐", time.perf_counter() - t0)
+                lap("取流+对齐", t0)
                 if frame is None:
                     continue
                 bgr, depth, intrinsics_frame = frame.bgr, frame.depth, frame.intrinsics
@@ -117,23 +129,30 @@ def main() -> int:
             if estimator is not None:
                 t0 = time.perf_counter()
                 poses, _ = estimator(bgr)
-                timer.add("YOLO pose", time.perf_counter() - t0)
+                lap("YOLO pose", t0)
             else:
                 poses = [fake_pose()]
 
+            # 跟踪/点云用合成姿态计时：噪声图上模型根本检不到人，若直接把 poses 传下去，
+            # 这两条路径没被跑到，会报出一个好看但没用的"0.02 ms"。
+            track_poses = poses if camera is not None and estimator is not None else [fake_pose()]
+            if index == args.warmup:
+                print(f"本帧真实检测到的人数: {len(poses)}（跟踪按 {len(track_poses)} 人计时）")
+
             t0 = time.perf_counter()
-            tracker.update(poses, depth, intrinsics_frame, threshold=0.5, t=index / 30.0)
-            timer.add("跟踪+3D", time.perf_counter() - t0)
+            tracker.update(track_poses, depth, intrinsics_frame, threshold=0.5, t=index / 30.0)
+            lap("跟踪+3D", t0)
 
             t0 = time.perf_counter()
             positions, _colors = pointcloud(
                 depth, bgr, intrinsics_frame, stride=args.stride, max_distance=4.0
             )
-            timer.add("点云", time.perf_counter() - t0)
+            lap("点云", t0)
 
-            timer.count += 1
-            if index == 0:
+            if index == args.warmup:
                 print(f"点云点数: {len(positions)} (stride={args.stride})")
+            if timed:
+                timer.count += 1
     finally:
         if camera is not None:
             camera.close()

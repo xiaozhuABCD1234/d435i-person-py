@@ -56,9 +56,14 @@ temporal = false
 hole_filling = false
 
 [detector]
-# 本包只做 pose（骨架）；换模型只改这一行。相对路径按项目根解析。
-# 想只数人头、不需要骨架：把 conf 调高、imgsz 调小即可，pose 模型一样出框。
-weights = "models/yolo26n-pose.pt"
+# 本包只做 pose（骨架）；相对路径按项目根解析。
+# 默认用 m：相比 n，半遮挡/中远距离的框和关键点明显更准，代价是 640 输入下
+# 约 9.7 ms/帧（n 约 4.4 ms，RTX 4060 Laptop 实测），而 15 Hz 的预算是 66 ms。
+# 本地已有：models/yolo26n-pose.pt（7.9 MB，最快）、models/yolo26m-pose.pt（49 MB）。
+# 想再强就下 s/l/x，比如：
+#   cd models && uv run python -c "from ultralytics import YOLO; YOLO('yolo26l-pose.pt')"
+# 然后把下面这行改成对应文件（l 约 58 MB，x 约 126 MB）。
+weights = "models/yolo26m-pose.pt"
 conf = 0.35
 imgsz = 640
 # "" = 有 CUDA 用 cuda:0，否则 cpu。
