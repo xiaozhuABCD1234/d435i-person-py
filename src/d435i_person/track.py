@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -23,11 +24,94 @@ import numpy as np
 
 from .geometry import Intrinsics, depth_valid_mask, lift_keypoints
 from .pose import KEYPOINT_NAMES_17, PoseInstance
-from .pose3d import person_position, to_display
+from .pose3d import (
+    HEAD_OFFSET,
+    HEIGHT_RANGE,
+    STAND_COS,
+    body_metrics,
+    joint_of,
+    person_position,
+    to_display,
+)
 
 NUM_KP = len(KEYPOINT_NAMES_17)
 # dt 的夹取范围（秒）：太小会让 F 退化，太大会让一帧预测飞出画面。
 MIN_DT, MAX_DT = 1e-3, 0.5
+# 相机系里的"上"（Y 向下，所以上 = -Y）；开了 [world] 就换成世界 Z 在相机系里的方向。
+DEFAULT_UP: tuple[float, float, float] = (0.0, -1.0, 0.0)
+
+
+@dataclass(frozen=True)
+class MetricsConfig:
+    """人体指标（速度/步态/尺寸）的参数。全部来自 config.toml 的 [metrics]。"""
+
+    enabled: bool = True
+    # "上"方向（相机系）。[world] 开着时由 CameraToWorld.up_in_camera() 给
+    up: tuple[float, float, float] = DEFAULT_UP
+    # 速度：卡尔曼速度状态直接读会很跳（15 Hz 下量测噪声导数化约 ±0.4 m/s），
+    # 所以再走一道指数平滑；tau 越小越跟手、越大越平滑。
+    speed_smoothing: float = 0.3
+    # 低于它就当静止（显示与分类用，不影响曲线原始值）。
+    speed_deadband: float = 0.15
+    # 步态：抬脚判据 = 踝的竖直位移超过 μ + k·σ（窗口内的均值/标准差）；
+    # 只有地面速度超过 walk_speed 时才计步（防止站着挪重心被算成走路）。
+    gait_window: float = 4.0
+    gait_lift_k: float = 0.8
+    walk_speed: float = 0.25
+    # 身高：鼻 -> 头顶补偿、合理区间、直立判据（见 pose3d.body_metrics）。
+    head_offset: float = HEAD_OFFSET
+    height_min: float = HEIGHT_RANGE[0]
+    height_max: float = HEIGHT_RANGE[1]
+    stand_cos: float = STAND_COS
+
+    def up_vector(self) -> np.ndarray:
+        return np.asarray(self.up, dtype=np.float64)
+
+
+class _Gait:
+    """单个人的步态：每只脚一个"抬脚"状态机，阈值由滑动窗口的 μ/σ 自适应。
+
+    信号是``(踝 - 髀中点) · 上方向``，也就是腿的伸展量：走路时它周期性地起伏。
+    抬脚 = 信号越过 μ + k·σ，落地 = 回落到 μ 以下。每次"抬脚→落地"算一步，
+    步频就用窗口内完成的步数除以实际跨度。比单目方案那套"猜步频"实在：
+    这里测的是真深度的竖直位移。
+    """
+
+    def __init__(self, window_s: float, lift_k: float, max_steps: int = 64):
+        self.window_s = float(window_s)
+        self.lift_k = float(lift_k)
+        self.samples: deque = deque()  # (t, (s_left, s_right))
+        self.lifted = [False, False]
+        self.steps: deque = deque(maxlen=max_steps)
+
+    def update(self, t: float, signals: tuple[float, float]) -> None:
+        self.samples.append((t, signals))
+        while self.samples and t - self.samples[0][0] > self.window_s:
+            self.samples.popleft()
+        for leg in (0, 1):
+            values = [s[1][leg] for s in self.samples if np.isfinite(s[1][leg])]
+            current = signals[leg]
+            if len(values) < 5 or not np.isfinite(current):
+                continue
+            mean = float(np.mean(values))
+            high = mean + self.lift_k * float(np.std(values))
+            low = mean + 0.2 * self.lift_k * float(np.std(values))
+            if not self.lifted[leg] and current > high:
+                self.lifted[leg] = True
+            elif self.lifted[leg] and current < low:
+                self.lifted[leg] = False
+                self.steps.append(t)
+        while self.steps and t - self.steps[0] > self.window_s:
+            self.steps.popleft()
+
+    def cadence(self) -> float:
+        """步/分钟；步数不够或跨度太短就给 nan（不让 UI 显示一个乱数）。"""
+        if len(self.steps) < 3:
+            return float("nan")
+        span = self.steps[-1] - self.steps[0]
+        if span < 0.5:
+            return float("nan")
+        return float(len(self.steps) - 1) * 60.0 / span
 
 
 def iou(a, b) -> float:
@@ -79,7 +163,7 @@ class ScalarKalman:
 
 @dataclass
 class TrackedPerson:
-    """跟踪结果：稳定的 3D 骨架 + 持久 id + 轨迹（都在相机坐标系，米）。"""
+    """跟踪结果：稳定的 3D 骨架 + 持久 id + 轨迹 + 人体指标（相机坐标系，米）。"""
 
     id: int
     conf: float
@@ -90,10 +174,15 @@ class TrackedPerson:
     names: list[str]
     strips: list[np.ndarray]
     position: np.ndarray  # (3,) 相机坐标，滤波后的位置；测不到是 nan
+    velocity: np.ndarray  # (3,) 相机系速度（m/s，已平滑）
+    speed: float  # |velocity|（m/s）
+    speed_ground: float  # 垂直于"上"方向的速度分量（m/s）；"人走多快"看它
+    metrics: dict[str, float]  # 人体尺寸 + 步态 + 速度，只含本帧有数的项
     trail: np.ndarray  # (T, 3) 相机坐标轨迹（旧的在前）
     age: int  # 连续/累计命中次数
     missed: int  # 最近连续漏检帧数（0 = 本帧命中了）
     valid_count: int  # 本帧有效关键点个数
+    state_speed: float = 0.15  # 状态标签阀值：低于它显示"静止"
 
     @property
     def distance(self) -> float:
@@ -101,6 +190,13 @@ class TrackedPerson:
         if not np.isfinite(self.position).all():
             return float("nan")
         return float(np.linalg.norm(self.position))
+
+    @property
+    def state(self) -> str:
+        """极简运动状态（给短标签用）：静止 / 行走 / ?。"""
+        if not np.isfinite(self.speed_ground):
+            return "?"
+        return "行走" if self.speed_ground >= self.state_speed else "静止"
 
     @property
     def label(self) -> str:
@@ -122,6 +218,13 @@ class _Track:
     kpt_conf: np.ndarray = field(default_factory=lambda: np.zeros(NUM_KP, np.float32))
     # 位置滤波是否已经被观测初始化过：没初始化过就不能报告 (0,0,0)（那是原点，不是"不知道"）
     pos_initialized: bool = False
+    # 速度（m/s，已指数平滑）与步态状态机；没滤波时用后向差分算速度
+    velocity: np.ndarray = field(default_factory=lambda: np.zeros(3, np.float32))
+    speed: float = 0.0
+    speed_ground: float = 0.0
+    prev_position: np.ndarray = field(default_factory=lambda: np.full(3, np.nan, np.float32))
+    prev_t: float = 0.0
+    gait: _Gait = field(default_factory=lambda: _Gait(4.0, 0.8))
     missed: int = 0
     age: int = 0
     last_t: float = 0.0
@@ -145,6 +248,7 @@ class PersonTracker:
         max_missed_kpt: int = 3,
         trail_length: int = 300,
         trail_interval: float = 0.1,
+        metrics: MetricsConfig | None = None,
     ):
         self.kalman = bool(kalman)
         self.q = float(process_noise)
@@ -156,6 +260,8 @@ class PersonTracker:
         self.max_missed_kpt = int(max_missed_kpt)
         self.trail_length = max(0, int(trail_length))
         self.trail_interval = max(0.0, float(trail_interval))
+        self.metrics = metrics or MetricsConfig()
+        self.up = self.metrics.up_vector()
         self.tracks: list[_Track] = []
         self._next_id = 1
 
@@ -213,6 +319,9 @@ class PersonTracker:
             kpt_conf=np.asarray(pose.kpt_conf, dtype=np.float32).copy(),
             position=np.asarray(position, dtype=np.float32).copy(),
             pos_initialized=initialized,
+            prev_position=np.asarray(position, dtype=np.float32).copy(),
+            prev_t=t,
+            gait=_Gait(self.metrics.gait_window, self.metrics.gait_lift_k),
             missed=0,
             age=1,
             last_t=t,
@@ -247,6 +356,7 @@ class PersonTracker:
         if np.isfinite(position).all():
             # 配对用的位置：拿到就用新的，没拿到就保留上一次已知的（短暂丢深度不该换 id）
             track.position = np.asarray(position, dtype=np.float32).copy()
+        self._update_speed(track, position, dt, t)
 
         track.seen |= ok
         track.missed_kpt = np.where(ok, 0, track.missed_kpt + 1)
@@ -268,9 +378,35 @@ class PersonTracker:
                 track.filters[i][axis].predict(dt)
         for axis in range(3):
             track.pos_filters[axis].predict(dt)
+        # 没新观测就不重算速度，但让 EMA 朝"保持原速度"衰减（卡尔曼本身也是这个假设）
+        self._update_speed(track, np.full(3, np.nan, np.float32), dt, t)
         track.missed += 1
         track.missed_kpt += 1
         track.last_t = t
+
+    def _update_speed(self, track: _Track, position: np.ndarray, dt: float, t: float) -> None:
+        """速度估计：优先用位置卡尔曼的速度状态，退回后向差分；再走一道 EMA。
+
+        为什么要 EMA：15 Hz 下量测噪声（r≈0.02 m）导数化后会产生 ±0.4 m/s 的抖动，
+        直接显示会看到速度在 0 和 1 之间乱跳。tau = 0 就关闭平滑。
+        """
+        if position is not None and np.isfinite(position).all():
+            if self.kalman and track.pos_initialized:
+                raw = np.array([filt.x[1] for filt in track.pos_filters], dtype=np.float64)
+            elif np.isfinite(track.prev_position).all() and dt > 0:
+                raw = (np.asarray(position, np.float64) - track.prev_position) / dt
+            else:
+                raw = np.zeros(3)
+            raw = np.where(np.isfinite(raw), raw, 0.0)
+            tau = self.metrics.speed_smoothing
+            alpha = 1.0 if tau <= 0 else 1.0 - math.exp(-dt / tau)
+            track.velocity = ((1.0 - alpha) * track.velocity + alpha * raw).astype(np.float32)
+            track.prev_position = np.asarray(position, dtype=np.float32).copy()
+            track.prev_t = t
+        speed = float(np.linalg.norm(track.velocity))
+        vertical = float(np.asarray(track.velocity, np.float64) @ self.up)
+        track.speed = speed
+        track.speed_ground = float(np.sqrt(max(speed**2 - vertical**2, 0.0)))
 
     def _append_trail(self, track: _Track, position: np.ndarray, t: float) -> None:
         """按 trail_interval 限流地记一个轨迹点（0 长度配置就完全不留轨迹）。"""
@@ -289,7 +425,7 @@ class PersonTracker:
             return np.full(3, np.nan, dtype=np.float32)
         return np.array([filt.position for filt in track.pos_filters], dtype=np.float32)
 
-    def _display(self, track: _Track, raw_position: np.ndarray) -> TrackedPerson:
+    def _display(self, track: _Track, raw_position: np.ndarray, t: float) -> TrackedPerson:
         if self.kalman:
             show = track.seen & (track.missed_kpt <= self.max_missed_kpt)
             points = np.full((NUM_KP, 3), np.nan, dtype=np.float32)
@@ -302,6 +438,7 @@ class PersonTracker:
             show = track.seen & (track.missed_kpt <= self.max_missed_kpt)
             raw = track.raw if track.raw is not None else np.full((NUM_KP, 3), np.nan, np.float32)
             joints, names, strips = to_display(raw, show)
+        metrics = self._metrics(track, joints, names, t)
         trail = np.asarray(track.trail, dtype=np.float32).reshape(-1, 3)
         # 漏检的轨迹：2D 关键点已经过期，别画（框留着，好看出"人刚刚还在这"）
         kpt_conf = track.kpt_conf if track.missed == 0 else np.zeros(NUM_KP, dtype=np.float32)
@@ -315,11 +452,54 @@ class PersonTracker:
             names=names,
             strips=strips,
             position=self._position_of(track, raw_position),
+            velocity=np.asarray(track.velocity, dtype=np.float32).copy(),
+            speed=track.speed,
+            speed_ground=track.speed_ground,
+            metrics=metrics,
             trail=trail,
             age=track.age,
             missed=track.missed,
             valid_count=int(np.count_nonzero(show)),
+            state_speed=self.metrics.speed_deadband,
         )
+
+    def _metrics(self, track: _Track, joints, names, t: float) -> dict[str, float]:
+        """本帧的人体指标：尺寸（真深度）+ 步态 + 速度。缺项的就不出键。"""
+        config = self.metrics
+        out: dict[str, float] = {}
+        if not config.enabled:
+            return out
+        out.update(
+            body_metrics(
+                joints,
+                names,
+                up=self.up,
+                head_offset=config.head_offset,
+                height_range=(config.height_min, config.height_max),
+                stand_cos=config.stand_cos,
+            )
+        )
+        out["speed"] = track.speed
+        out["speed_ground"] = track.speed_ground
+
+        # 步态：用"踝相对髀中点沿上方向的伸展量"做为周期信号。
+        hip = joint_of(joints, names, "left_hip")
+        hip_r = joint_of(joints, names, "right_hip")
+        if hip is not None and hip_r is not None:
+            hip_mid = (hip + hip_r) * 0.5
+            signals = []
+            for name in ("left_ankle", "right_ankle"):
+                ankle = joint_of(joints, names, name)
+                signals.append(
+                    float((ankle - hip_mid) @ self.up) if ankle is not None else float("nan")
+                )
+            track.gait.update(t, (signals[0], signals[1]))
+            if track.speed_ground >= config.walk_speed:
+                cadence = track.gait.cadence()
+                if np.isfinite(cadence) and cadence > 0:
+                    out["cadence"] = cadence  # 步/分钟
+                    out["stride"] = track.speed_ground * 60.0 / cadence  # 米/步
+        return out
 
     # ------------------------------------------------------------------ 入口
     def update(
@@ -380,6 +560,6 @@ class PersonTracker:
         empty = np.full(3, np.nan, dtype=np.float32)
 
         self.tracks = [track for track in self.tracks if track.missed <= self.max_missed]
-        out = [self._display(track, raw_by_id.get(track.id, empty)) for track in self.tracks]
+        out = [self._display(track, raw_by_id.get(track.id, empty), t) for track in self.tracks]
         out.sort(key=lambda person: person.id)
         return out

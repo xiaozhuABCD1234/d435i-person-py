@@ -78,10 +78,28 @@ class Settings:
     rerun_server_memory_limit: str = "512MB"
     rerun_jpeg_quality: int = 75
     rerun_port: int = 9876
-    # 右上角面板：默认显示"人体坐标"（坐标表 + 每个人的 X/Y/Z 曲线），
-    # 人数曲线改成默认关（数据照样在 person/count 与 JSONL 里）。
-    rerun_show_coords: bool = True
+    # 右上角面板：人体指标曲线 + 每人一行极简数值；坐标曲线与人数曲线默认关。
+    rerun_show_metrics: bool = True
+    rerun_show_values: bool = True
+    rerun_show_coords: bool = False
     rerun_show_count: bool = False
+
+    # -------------------------------------------------------------- [metrics]
+    # 人体指标（速度/步态/尺寸）。关掉就少算一点，也不记 person/metrics/*。
+    metrics_enabled: bool = True
+    # 速度：卡尔曼速度状态直接读很跳，再走一道指数平滑（秒）；越小越跟手。
+    speed_smoothing: float = 0.3
+    # 低于它就当“静止”（只影响显示与状态标签）。
+    speed_deadband: float = 0.15
+    # 步态：抬脚判据 μ + k·σ，窗口秒数；只有地面速度 ≥ walk_speed 时才计步。
+    gait_window: float = 4.0
+    gait_lift_k: float = 0.8
+    walk_speed: float = 0.25
+    # 身高：鼻 -> 头顶补偿（米）、合理区间（超出就丢弃）、直立判据（夹角余弦）。
+    head_offset: float = 0.12
+    height_min: float = 1.2
+    height_max: float = 2.2
+    stand_cos: float = 0.8
 
     # ---------------------------------------------------------------- [pose3d]
     pose3d_enabled: bool = True
@@ -161,6 +179,18 @@ CONFIG_FIELDS: dict[tuple[str, str], str] = {
     ("rerun", "port"): "rerun_port",
     ("rerun", "show_coords"): "rerun_show_coords",
     ("rerun", "show_count"): "rerun_show_count",
+    ("rerun", "show_metrics"): "rerun_show_metrics",
+    ("rerun", "show_values"): "rerun_show_values",
+    ("metrics", "enabled"): "metrics_enabled",
+    ("metrics", "speed_smoothing"): "speed_smoothing",
+    ("metrics", "speed_deadband"): "speed_deadband",
+    ("metrics", "gait_window"): "gait_window",
+    ("metrics", "gait_lift_k"): "gait_lift_k",
+    ("metrics", "walk_speed"): "walk_speed",
+    ("metrics", "head_offset"): "head_offset",
+    ("metrics", "height_min"): "height_min",
+    ("metrics", "height_max"): "height_max",
+    ("metrics", "stand_cos"): "stand_cos",
     ("pose3d", "enabled"): "pose3d_enabled",
     ("pose3d", "kalman"): "pose3d_kalman",
     ("pose3d", "kalman_process"): "pose3d_kalman_process",

@@ -84,6 +84,14 @@ class CameraToWorld:
         out = (self.rotation() @ flat.T).T + self.translation()
         return out.reshape(arr.shape).astype(np.float32)
 
+    def up_in_camera(self) -> np.ndarray:
+        """世界系的"上"方向在**相机坐标系**里的表示（= Rᵀ·(0,0,1)_world）。
+
+        量身高/腿长这类"沿上方向"的尺寸时必须用这个，而不是相机 Y：
+        镜头一旦俯仰，相机 Y 就不再是人体竖直方向。
+        """
+        return (self.rotation().T @ np.array([0.0, 0.0, 1.0])).astype(np.float64)
+
     def describe(self) -> str:
         return (
             f"高度 {self.height:g} m, 俯仰 {self.pitch_deg:g}°, "

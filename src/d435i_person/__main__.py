@@ -32,8 +32,7 @@ from .config import (
     resolve_path,
 )
 from .geometry import pointcloud
-from .pose3d import landmarks
-from .track import PersonTracker
+from .track import MetricsConfig, PersonTracker
 from .world import CameraToWorld
 
 
@@ -161,7 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="rerun_show_coords",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="覆盖 [rerun].show_coords：右上角的人体坐标表 + X/Y/Z 曲线（默认开）",
+        help="覆盖 [rerun].show_coords：右上角加一组 X/Y/Z 坐标曲线",
     )
     p.add_argument(
         "--count-view",
@@ -169,6 +168,27 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="覆盖 [rerun].show_count：右上角再放一条人数曲线（默认关）",
+    )
+    p.add_argument(
+        "--metrics-view",
+        dest="rerun_show_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [rerun].show_metrics：人体指标曲线（速度/身高/肩宽/步频…，默认开）",
+    )
+    p.add_argument(
+        "--values-view",
+        dest="rerun_show_values",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [rerun].show_values：每人一行极简数值（默认开）",
+    )
+    p.add_argument(
+        "--metrics",
+        dest="metrics_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [metrics].enabled：算不算人体指标（速度/步态/尺寸）",
     )
 
     pose3d_group = p.add_mutually_exclusive_group()
@@ -267,15 +287,17 @@ def print_settings(settings: Settings, config_path: str) -> None:
 def _person_record(person, world: CameraToWorld | None) -> dict:
     """一个人 -> 一行 JSON。世界坐标只在 [world] 开着时才有。"""
     position = person.position
-    points = landmarks(person)
     record = {
         "id": int(person.id),
         "conf": round(float(person.conf), 4),
         "distance": None if not np.isfinite(person.distance) else round(person.distance, 4),
         "cam": [round(float(v), 4) for v in position] if np.isfinite(position).all() else None,
         "world": None,
-        # 髀中点/肩中点/踝中点/鼻（相机系，米）；缺哪个关节就没有哪个键
-        "landmarks": {key: [round(float(v), 4) for v in point] for key, point in points.items()},
+        "speed": round(float(person.speed_ground), 4),
+        "state": person.state,
+        "velocity": [round(float(v), 4) for v in person.velocity],
+        # 人体尺寸/步态：身高/肩宽/髀宽/腿长/步频/步幅…缺项的键不会出现
+        "metrics": {key: round(float(value), 4) for key, value in person.metrics.items()},
         "box": [round(float(v), 2) for v in person.box],
         "valid_keypoints": int(person.valid_count),
         "age": int(person.age),
@@ -387,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
             world_pointcloud=settings.world_pointcloud,
             show_coords=settings.rerun_show_coords,
             show_count=settings.rerun_show_count,
+            show_metrics=settings.rerun_show_metrics,
+            show_values=settings.rerun_show_values,
         )
         if rrd:
             print(f"rerun 记录 -> {rrd}")
@@ -408,6 +432,20 @@ def main(argv: list[str] | None = None) -> int:
         max_missed_kpt=settings.max_missed_kpt,
         trail_length=settings.trail_length,
         trail_interval=settings.trail_interval,
+        metrics=MetricsConfig(
+            enabled=settings.metrics_enabled,
+            # 开了 [world] 就用世界系的"上"——否则镜头一俯仰，身高和腿长就发虚
+            up=tuple(world.up_in_camera()) if world is not None else (0.0, -1.0, 0.0),
+            speed_smoothing=settings.speed_smoothing,
+            speed_deadband=settings.speed_deadband,
+            gait_window=settings.gait_window,
+            gait_lift_k=settings.gait_lift_k,
+            walk_speed=settings.walk_speed,
+            head_offset=settings.head_offset,
+            height_min=settings.height_min,
+            height_max=settings.height_max,
+            stand_cos=settings.stand_cos,
+        ),
     )
 
     save_dir = resolve_path(settings.save_dir) if settings.save_dir else None

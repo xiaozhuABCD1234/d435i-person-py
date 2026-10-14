@@ -88,6 +88,112 @@ def landmarks(person, spec: tuple[tuple[str, tuple[str, ...]], ...] = LANDMARKS)
     return out
 
 
+# 相机系里的"上"：相机 RDF 的 Y 向下，所以上 = -Y。开着 [world] 时改用世界 Z 在
+# 相机系里的表示（见 world.CameraToWorld.up_in_camera），否则镜头一俯仰身高就发虚。
+DEFAULT_UP = np.array([0.0, -1.0, 0.0], dtype=np.float64)
+
+# 人体尺寸的默认参数（都能在 config.toml 的 [metrics] 里改）：
+#   head_offset：COCO-17 里最高点是鼻尖，比头顶低约 0.12 m（成人比例），不补就系统性
+#                低估身高（约 7%）。想按自己人的数据标定就改这里。
+#   height_range：身高合理区间，超出就当骨架算错了，宁可不给数。
+#   stand_cos：肩-髀连线与"上"方向的夹角余弦阈值，用判直立（1.0 = 笔直）。
+HEAD_OFFSET = 0.12
+HEIGHT_RANGE = (1.2, 2.2)
+STAND_COS = 0.8
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 0 else vector
+
+
+def joint_of(joints, names, name: str) -> np.ndarray | None:
+    """从``(M,3)`` 关节 + 名字列表里按名字取一个点；缺/非有限就 None。"""
+    joints = np.asarray(joints)
+    keys = list(names)
+    if name not in keys or not len(joints):
+        return None
+    point = np.asarray(joints[keys.index(name)], dtype=np.float64)
+    return point if point.shape == (3,) and np.isfinite(point).all() else None
+
+
+def _point(person, name: str) -> np.ndarray | None:
+    """按名字取关节坐标；没有就 None。"""
+    return joint_of(person.joints, person.names, name)
+
+
+def body_metrics(
+    joints,
+    names,
+    *,
+    up: np.ndarray | None = None,
+    head_offset: float = HEAD_OFFSET,
+    height_range: tuple[float, float] = HEIGHT_RANGE,
+    stand_cos: float = STAND_COS,
+) -> dict[str, float]:
+    """从 3D 骨架``(M,3)`` + 名字列表量人体尺寸（米）。**只给有效的指标**。
+
+    真深度量出来的是真实长度（1-3 m 内深度误差 ~1%），所以这些数字比单目方案可靠得多：
+
+    =================  ==========================================  ==============
+    ``height``         鼻(+head_offset) 到踝中点沿 "上" 的投影     需直立 + 头/踝
+    ``shoulder_width`` 左右肩 3D 距离                               侧身时是投影宽
+    ``hip_width``      左右髀 3D 距离                               同理
+    ``torso``          肩中点 -> 髀中点沿 "上" 的长度               需直立体态
+    ``leg``            髀中点 -> 踝中点沿 "上" 的长度               蹲/坐时变短
+    ``arm_span``       左右腕 3D 距离                               手插兜/遮挡就没有
+    ``coverage``       有效关节数 / 17（可信度自检）                总有
+    =================  ==========================================  ==============
+
+    ``height`` 只在"躯干接近直立 + 头与双踝都有效 + 落在 ``height_range`` 内"才给：
+    坐着、躺着、半身入画时，给身高比不给身高更容易被误读。
+    """
+
+    def point(name: str) -> np.ndarray | None:
+        return joint_of(joints, names, name)
+
+    axis = _unit(np.asarray(up if up is not None else DEFAULT_UP, dtype=np.float64))
+    out: dict[str, float] = {"coverage": float(len(joints)) / len(KEYPOINT_NAMES_17)}
+
+    def mid(first: str, second: str) -> np.ndarray | None:
+        a, b = point(first), point(second)
+        if a is None or b is None:
+            return None
+        return (a + b) * 0.5
+
+    shoulder_mid = mid("left_shoulder", "right_shoulder")
+    hip_mid = mid("left_hip", "right_hip")
+    ankle_mid = mid("left_ankle", "right_ankle")
+
+    def width(first: str, second: str, key: str) -> None:
+        a, b = point(first), point(second)
+        if a is not None and b is not None:
+            out[key] = float(np.linalg.norm(a - b))
+
+    width("left_shoulder", "right_shoulder", "shoulder_width")
+    width("left_hip", "right_hip", "hip_width")
+    width("left_wrist", "right_wrist", "arm_span")
+
+    if shoulder_mid is not None and hip_mid is not None:
+        torso_vector = shoulder_mid - hip_mid
+        length = float(np.linalg.norm(torso_vector))
+        out["torso"] = float(torso_vector @ axis)
+        standing = length > 1e-6 and float(_unit(torso_vector) @ axis) >= stand_cos
+    else:
+        standing = False
+
+    if hip_mid is not None and ankle_mid is not None:
+        out["leg"] = float((hip_mid - ankle_mid) @ axis)
+
+    nose = point("nose")
+    if standing and nose is not None and ankle_mid is not None:
+        top = nose + head_offset * axis
+        height = float((top - ankle_mid) @ axis)
+        if height_range[0] <= height <= height_range[1]:
+            out["height"] = height
+    return out
+
+
 def to_display(points3d: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, list[str], list]:
     """``(17,3)`` + 有效掩码 -> ``(关节 (M,3), 名字, 骨头线段列表)``。
 
