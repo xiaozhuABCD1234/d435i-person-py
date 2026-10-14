@@ -57,6 +57,37 @@ class Person3D:
         return int(np.count_nonzero(self.valid))
 
 
+# 表格/日志里要报的"人体具体坐标"：成对的关键点取中点，单点就用它自己。
+# 顺序就是展示顺序：髀（人体质心附近，最有用）-> 肩 -> 踝（接地位置）-> 鼻（头顶高度）。
+LANDMARKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("hip", ("left_hip", "right_hip")),
+    ("shoulder", ("left_shoulder", "right_shoulder")),
+    ("ankle", ("left_ankle", "right_ankle")),
+    ("nose", ("nose",)),
+)
+
+
+def landmarks(person, spec: tuple[tuple[str, tuple[str, ...]], ...] = LANDMARKS) -> dict:
+    """从 3D 骨架里按名字取几个代表性点（相机坐标系，米）。
+
+    ``person`` 只要带 ``joints`` / ``names`` 就行（``Person3D`` 与 ``TrackedPerson``
+    都满足）。缺掉的关节直接不出现在结果里，不会用 nan 占位。
+    """
+    out: dict[str, np.ndarray] = {}
+    joints = np.asarray(person.joints)
+    names = list(person.names)
+    if not len(joints):
+        return out
+    for label, keys in spec:
+        found = [joints[names.index(key)] for key in keys if key in names]
+        if not found:
+            continue
+        point = np.mean(found, axis=0).astype(np.float32)
+        if np.isfinite(point).all():
+            out[label] = point
+    return out
+
+
 def to_display(points3d: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, list[str], list]:
     """``(17,3)`` + 有效掩码 -> ``(关节 (M,3), 名字, 骨头线段列表)``。
 

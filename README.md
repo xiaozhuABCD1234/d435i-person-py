@@ -30,7 +30,9 @@ uv run d435i-person --list               # 枚举 RealSense 设备
 uv run d435i-person --show-config        # 打印合并后的生效参数
 uv run d435i-person                      # 按 config.toml 跑（开 rerun 窗口）
 uv run d435i-person --duration 30        # 临时覆盖某一项
-uv run d435i-person --weights models/yolo26n-pose.pt   # 临时换小模型（快一倍）
+uv run d435i-person --weights models/yolo26n-pose.pt --detect-hz 60   # n 模型可以真跑到 60 Hz
+uv run d435i-person --coords-view --count-view                          # 坐标表 + 人数曲线都要
+uv run d435i-person --count-view --no-coords-view                       # 只要人数曲线（旧布局）
 uv run d435i-person --no-rerun --max-frames 300        # 只看结果，不开窗口不写文件
 uv run d435i-person --world --world-height 1.35 --world-pitch 20   # 打开世界坐标系
 uv run python tools/check_camera.py --save out/        # 不跑模型的相机自检
@@ -55,7 +57,7 @@ fps = 30
 exposure_mode = "sdk"         # sdk = 相机自动曝光/增益；manual = 固定用 exposure_us/gain
 laser_power = -1.0            # 激光功率，-1 = 不动（关发射器会让无纹理面出现空洞）
 emitter_enabled = -1          # 1 开 / 0 关，-1 = 不动
-read_timeout_ms = 5000
+read_timeout_ms = 1000        # 60 fps 下帧间隔只有 17 ms，超时不用设得很宽
 
 [filters]
 spatial = false               # 深度后处理：默认全关，边缘更干净
@@ -63,13 +65,15 @@ temporal = false
 hole_filling = false
 
 [detector]
-weights = "models/yolo26m-pose.pt"   # 只做 pose；相对路径按项目根解析（见下方"模型选择"）
+weights = "models/yolo26x-pose.pt"   # 只做 pose；相对路径按项目根解析（见下方"模型选择"）
 conf = 0.35
 imgsz = 640
 kpt_conf = 0.5                # 关键点置信度阈值（2D/3D 骨架、有效点计数都受影响）
 
 [run]
-detect_hz = 15.0              # 相机更快时多余帧只取流不推理
+# 按**模型实测能力**设，不是按相机 fps：x 模型 64.5 ms/帧 -> 15 Hz
+# （相机仍是 60 fps 取流，中间帧丢掉不推理；用 m/n 模型就拉到 30/60）
+detect_hz = 15.0
 save_dir = ""                 # 检测到人时存标注图
 
 [output]
@@ -119,30 +123,48 @@ X = (u - cx) * Z / fx     Y = (v - cy) * Z / fy     Z = depth
 单像素会被背景抢走，中值稳得多。窗口内没有有效值就是 nan，该关键点这一帧不算数
 （`valid_count` 会掉），骨头只在两端都有效时才画。
 
-## 模型选择
+## 模型选择与 60 fps
 
-默认 `models/yolo26m-pose.pt`（49 MB）。官方预训练都在 `ultralytics/assets` 的 release
-里，`YOLO("yolo26l-pose.pt")` 会自动下载到当前目录：
+**先分清两件事：相机的 60 fps 只是取流上限，和推理帧率无关。** 配置里分开控制：
+`[camera].fps = 60` 决定相机多久给一帧（日志里的"X 帧跳推理"就是被丢掉的那些），
+`[run].detect_hz` 决定多久跑一次模型。所以"相机 60 fps + 推理 15 Hz"是完全正常的
+组合，好处是时间戳更密、运动更连贯。
+
+三者实测（RTX 4060 Laptop、输入 640×480、`imgsz 640`、20 帧热身后计 200 帧；
+可视化开销 = JPEG 编码 + 深度/点云/坐标记录，也实测约 3.8 ms/帧）：
+
+| 权重 | 大小 | YOLO pose | 全链路（含跟踪/点云/可视化） | 60 Hz 推理？ |
+| --- | --- | --- | --- | --- |
+| `yolo26n-pose.pt` | 7.9 MB | 4.4 ms | ~9.6 ms → ~104 fps | ✅ 宽松 |
+| `yolo26m-pose.pt` | 49 MB | 9.7 ms | ~14.9 ms → ~67 fps | ✅ **能跑满 60 fps** |
+| `yolo26x-pose.pt`（当前） | 126 MB | **64.5 ms** | **~70 ms → ~14 Hz** | ❌ 差 4 倍 |
+| `yolo26x-pose.pt` @ `imgsz 512` | — | 39.0 ms | ~45 ms → ~22 Hz | ❌ |
+
+结论：**x 模型 + 60 Hz 推理在这台机器上做不到**（60 Hz 的预算是 16.7 ms/帧，x 光
+模型就要 64.5 ms）。想要真 60 fps 就用 m；可行的四种配法：
+
+```bash
+# A）要 x 的精度：相机 60 fps、推理 ~14 Hz（当前 config.toml，detect_hz 15）
+uv run d435i-person
+
+# B）要真 60 Hz 端到端：换 m
+uv run d435i-person --weights models/yolo26m-pose.pt --detect-hz 60
+
+# C）要 60 Hz 且余量充足：换 n
+uv run d435i-person --weights models/yolo26n-pose.pt --detect-hz 60
+
+# D）x 降分辨率换频率（约 22 Hz）
+uv run d435i-person --imgsz 512 --detect-hz 22
+```
+
+想再往上走只有导出加速这条路（`model.export(format='engine', half=True)` 走 TensorRT，
+需要额外装 tensorrt；ONNX Runtime 也能快 1.3–2×），代价是要多一套推理后端。
+官方预训练都在 `ultralytics/assets` 的 release 里，`YOLO("yolo26l-pose.pt")`
+会自动下载到当前目录：
 
 ```bash
 cd models && uv run python -c "from ultralytics import YOLO; YOLO('yolo26l-pose.pt')"
 ```
-
-RTX 4060 Laptop、输入 640×480、`imgsz 640` 实测（`tools/bench.py --no-camera`，
-20 帧热身后再计 200 帧）：
-
-| 权重 | 大小 | YOLO pose | 相对 m 的速度 |
-| --- | --- | --- | --- |
-| `yolo26n-pose.pt` | 7.9 MB | 4.4 ms | 2.2× |
-| `yolo26s-pose.pt` | 24 MB | — | — |
-| **`yolo26m-pose.pt`（当前）** | 49 MB | **9.7 ms** | 1× |
-| `yolo26l-pose.pt` | 58 MB | — | — |
-| `yolo26x-pose.pt` | 126 MB | — | — |
-
-15 Hz 的检测预算是 66 ms，所以 m（9.7 ms）甚至 x 都塞得下：**瓶颈从来不在模型**，
-而在取流节奏（30 fps ≈ 33 ms/帧）和 viewer 的内存。真的想更准，优先级大致是：
-换大模型 → `imgsz 768`（关键点分辨率翻倍，代价约 1.4×）→ 调 `[detector].conf` /
-`kpt_conf`。
 
 ## 世界坐标怎么用
 
@@ -181,12 +203,19 @@ JSON Lines 里每人也多一个 `world` 字段。
 | `camera/pose3d/joints` `skeleton` | 真深度 3D 骨架 |
 | `camera/pose3d/trails` `positions` | 轨迹、每人 3D 位置（标签带距离） |
 | `world/...` | 世界系视图（`[world].enabled` 时才记） |
-| `person/count` | 人数曲线（TimeSeriesView） |
+| `person/table` | **人体坐标表**（位置表 + 髀/肩/踝/鼻，相机系与世界系） |
+| `person/coords/<id>/{x,y,z}` | 每个人的坐标曲线（相机系，TimeSeriesView） |
+| `person/count` | 人数标量（默认不再占面板，需要就把 `[rerun].show_count` 打开） |
 | `person/events` | 人数变化日志 |
-| `person/table` | 当前每个人的 id/距离/相机坐标/世界坐标（markdown 表） |
 
-布局：左边彩色（下面对齐深度），右边人数曲线 + 3D 骨架/点云（+ 世界系视图）。
-每个人的颜色由 id 决定，2D 和 3D 里同一个 id 同色，一眼看得出谁是谁。
+布局：左边彩色（下面对齐深度），右边 **人体坐标**（上：坐标表，下：X/Y/Z 曲线）
++ 3D 骨架/点云（+ 世界系视图）。每个人的颜色由 id 决定，2D 和 3D 里同一个 id 同色，
+一眼看得出谁是谁。
+
+坐标面板用 `[rerun].show_coords` / `show_count` 控制：两个都开也行，都关就只剩图像和 3D。
+曲线是**相机坐标系**（X 右 / Y 下 / Z 前）；开了 `[world]` 后曲线仍用相机系（保持坐标轴
+含义固定），世界坐标在表里看；想把曲线也换成世界系，把 `viz.py` 里
+`person/coords` 改成 `person/world_coords` 即可（两组都在 .rrd 里）。
 
 `keep_history = false`（默认）时图像/点云/骨架都用 **static** 记录：viewer 只留最新
 一份，内存不随帧数涨。想回拖时间轴就 `--rerun-keep-history`（内存会一直涨）。
@@ -198,12 +227,16 @@ JSON Lines 里每人也多一个 `world` 字段。
 ```json
 {"t": 1234.567, "frame": 8123, "device_timestamp_ms": 45678.9, "count": 2,
  "people": [{"id": 3, "conf": 0.87, "distance": 2.31, "cam": [0.12, -0.05, 2.31],
-             "world": [0.31, -0.12, 1.10], "box": [301.2, 120.4, 360.8, 470.1],
+             "world": [0.31, -0.12, 1.10],
+             "landmarks": {"hip": [0.12, -0.05, 2.31], "shoulder": [0.10, -0.38, 2.31],
+                           "ankle": [0.14, 0.42, 2.32], "nose": [0.09, -0.55, 2.30]},
+             "box": [301.2, 120.4, 360.8, 470.1],
              "valid_keypoints": 14, "age": 96}]}
 ```
 
-`world` 只在 `[world].enabled` 时非 null。`--save-dir` 另存标注图（按需 `annotate()`，
-不是每帧都画）。
+`world` 只在 `[world].enabled` 时非 null；`landmarks` 里缺哪个关节（被遮挡、深度没测到）
+就少哪个键，`cam`/世界坐标都是米制的相机坐标系（X 右 / Y 下 / Z 前）。
+`--save-dir` 另存标注图（按需 `annotate()`，不是每帧都画）。
 
 ## 开发
 
@@ -224,7 +257,7 @@ uv run python tools/bench.py             # 分阶段计时：取流/YOLO/跟踪/
 ```
 d435i-person-py/
 ├── config.toml                 全部参数（唯一的"旋钮面板"）
-├── models/                     yolo26n-pose.pt（最快）、yolo26m-pose.pt（默认）
+├── models/                     yolo26n/m/x-pose.pt（默认用 x，见"模型选择与 60 fps"）
 ├── src/d435i_person/
 │   ├── __main__.py             CLI + 主循环（限速、点云/JSONL 的频率、存图）
 │   ├── config.py               参数读取/校验/命令行覆盖
@@ -242,20 +275,32 @@ d435i-person-py/
 
 ## 性能
 
-实测（RTX 4060 Laptop、640×480×30、`imgsz 640`、`yolo26m-pose`、
-`tools/bench.py --no-camera --frames 220`，20 帧热身）：
+实测（RTX 4060 Laptop、640×480、`imgsz 640`、`tools/bench.py --no-camera --frames 220`，
+20 帧热身）：
 
-| 阶段 | 实测 |
-| --- | --- |
-| 取流 + 对齐 | 30 fps 上限 ≈ 33 ms/帧（相机节奏，不是计算） |
-| YOLO pose（m / n） | **9.7 ms** / 4.4 ms |
-| 跟踪 + 3D（1 人；17 点 5×5 中值取深度 + 51 个卡尔曼） | **0.95 ms**（每人线性增长，4 人 ≈ 3.4 ms） |
-| 点云（stride 4，1.92 万点） | **0.43 ms** |
-| 合计（m，1 人） | 11.1 ms → 计算侧上限约 90 fps |
+| 阶段 | n | m | x |
+| --- | --- | --- | --- |
+| YOLO pose | 4.4 ms | 9.7 ms | **64.5 ms** |
+| 可视化记录（JPEG 编码 + 深度/点云/骨架/坐标） | 3.8 ms | 3.8 ms | 3.8 ms |
+| 跟踪 + 3D（1 人；17 点 5×5 中值取深度 + 51 个卡尔曼） | 0.95 ms | 0.95 ms | 1.4 ms |
+| 点云（stride 4，1.92 万点） | 0.43 ms | 0.43 ms | 0.6 ms |
+| 全链路（1 人） | ~9.6 ms | ~14.9 ms | ~70 ms |
+| 能达到的端到端上限 | ~104 fps | ~67 fps | **~14 Hz** |
 
-所以瓶颈永远是 viewer 内存/带宽与相机节奏，不是计算：默认 `detect_hz = 15`、
-`points.hz = 10`、图像送 viewer 前压 JPEG。要更高频就 `--detect-hz 30`，但别同时把
-`--rerun-keep-history` 打开。
+两点值得记住：
+
+* **首帧很贵**：CUDA 初始化与 cuDNN 选算法都落在第一帧（x 上实测约 1 s），所以
+  "只跑 10 帧"算出来的均值会翻倍；`tools/bench.py` 默认先热身 20 帧就是这个原因。
+* **相机不是瓶颈**：640×480 双流 @60 fps 约 92 MB/s，USB3.2 富裕；取流+对齐几乎不占
+  CPU（拷 0.92 MB）。换更大模型时先看的是模型耗时，不是相机。
+
+自己复现/换参数：
+
+```bash
+uv run python tools/bench.py --frames 200                    # 分阶段（含相机）
+uv run python tools/bench.py --no-camera --weights models/yolo26n-pose.pt   # 不占相机比模型
+uv run python tools/check_camera.py --frames 60              # 只看相机侧帧率与深度质量
+```
 
 自己复现/换参数：
 
@@ -274,6 +319,9 @@ uv run python tools/check_camera.py --frames 60              # 只看相机侧�
 | 帧率只有个位数 / 深度分辨率被砍 | 插在 USB2 口或线太差；`--list` 看 `usb=` 字段必须是 3.2 |
 | `RuntimeError: Couldn't resolve requests` | 该设备/固件不支持这组 分辨率+格式+帧率，用 `rs-enumerate-devices -c` 查（D435i 深度 640x480@90 支持，1280x720 只有 @30/15/6） |
 | 有效深度很低（<50%）、骨架缺关节 | 无纹理/反光/太近太远；先开发射器（`--emitter 1`）、把 `laser_power` 调高，或试 `--spatial --temporal`；D435i 最准区间约 0.3–3 m |
+| 相机设了 60 fps，但日志只有 15 fps 端到端 | 正常：`detect_hz` 是按模型能力设的，x 模型 64.5 ms/帧。想要 60 Hz 推理换 n（`--weights models/yolo26n-pose.pt --detect-hz 60`）；日志里的"X 帧跳推理"就是为它丢的帧 |
+| 启动报 `Couldn't resolve requests`（60 fps 时） | 某些固件/机型下彩色 60 fps 只支持特定格式：本机 640x480 的 RGB8/BGR8/YUYV 都支持 @60，1280x720 只有 @30/15/6 |
+| 右上角看不到坐标表 | 需要 `[rerun].show_coords = true`（默认已开）；表格在窗口偏窄时需要拖分隔条或拉宽窗口 |
 | 3D 骨架"呼吸"/抖 | 提高 `[pose3d].kalman_measurement`（更平滑），或开 `--temporal` 深度滤镜 |
 | 两个人换 id | 调大 `[track].iou_threshold`，或设 `match_max_distance = 1.0`（米） |
 | id 越用越多、同一个人被数两遍 | `[track].max_missed` 调大（容忍更久的遮挡），或 `detect_hz` 调高 |

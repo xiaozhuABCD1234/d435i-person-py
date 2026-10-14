@@ -78,6 +78,10 @@ class Settings:
     rerun_server_memory_limit: str = "512MB"
     rerun_jpeg_quality: int = 75
     rerun_port: int = 9876
+    # 右上角面板：默认显示"人体坐标"（坐标表 + 每个人的 X/Y/Z 曲线），
+    # 人数曲线改成默认关（数据照样在 person/count 与 JSONL 里）。
+    rerun_show_coords: bool = True
+    rerun_show_count: bool = False
 
     # ---------------------------------------------------------------- [pose3d]
     pose3d_enabled: bool = True
@@ -155,6 +159,8 @@ CONFIG_FIELDS: dict[tuple[str, str], str] = {
     ("rerun", "server_memory_limit"): "rerun_server_memory_limit",
     ("rerun", "jpeg_quality"): "rerun_jpeg_quality",
     ("rerun", "port"): "rerun_port",
+    ("rerun", "show_coords"): "rerun_show_coords",
+    ("rerun", "show_count"): "rerun_show_count",
     ("pose3d", "enabled"): "pose3d_enabled",
     ("pose3d", "kalman"): "pose3d_kalman",
     ("pose3d", "kalman_process"): "pose3d_kalman_process",

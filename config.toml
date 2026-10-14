@@ -12,11 +12,14 @@ index = 0
 
 # 分辨率/帧率。两路都开，深度会被对齐到彩色视角（对齐后深度分辨率 = 彩色分辨率）。
 # 可选值见 `rs-enumerate-devices -c`：D435i 深度 640x480/848x480 都支持
-# @90/60/30/15/6，彩色 640x480/848x480/1280x720 @60/30/15/6。
-# 60 fps 时 USB3 带宽会被占掉更多，按需调；30 fps 是稳妥的默认。
+# @90/60/30/15/6，彩色 640x480/848x480 支持 @60，1280x720 只有 @30/15/6。
+#
+# 60 fps 只是**取流**上限，与推理帧率无关：推理跟不上时多余帧直接丢掉（日志里的
+# "X 帧跳推理"），所以相机跑 60 而 detect_hz 只有 15 是完全正常的组合，好处是抖动
+# 更小、时间戳更密。本机实测 640x480x60 双流带宽约 92 MB/s，USB3.2 富裕。
 color_size = "640x480"
 depth_size = "640x480"
-fps = 30
+fps = 60
 
 # 曝光/增益：
 #   "sdk"    = 用相机自己的自动曝光 + 自动增益（默认，推荐）
@@ -43,8 +46,10 @@ emitter_enabled = -1
 # 4=Medium Density（具体编号用 `rs-enumerate-devices -c` 或 viewer 里的下拉框确认）。
 depth_preset = -1
 
-# 取一帧的等待上限（毫秒）。低于相机帧间隔会开始丢帧。
-read_timeout_ms = 5000
+# 取一帧的等待上限（毫秒）。低于相机帧间隔会开始丢帧；
+# 60 fps 下帧间隔只有 17 ms，所以别把超时设得跟 30 fps 那么宽，
+# 否则真卡住了要等很久才能恢得过来。
+read_timeout_ms = 1000
 
 [filters]
 # 深度的后处理滤镜。默认全关：D435i 原生深度对关键点已经够用，滤镜会模糊边缘、
@@ -57,13 +62,17 @@ hole_filling = false
 
 [detector]
 # 本包只做 pose（骨架）；相对路径按项目根解析。
-# 默认用 m：相比 n，半遮挡/中远距离的框和关键点明显更准，代价是 640 输入下
-# 约 9.7 ms/帧（n 约 4.4 ms，RTX 4060 Laptop 实测），而 15 Hz 的预算是 66 ms。
-# 本地已有：models/yolo26n-pose.pt（7.9 MB，最快）、models/yolo26m-pose.pt（49 MB）。
-# 想再强就下 s/l/x，比如：
-#   cd models && uv run python -c "from ultralytics import YOLO; YOLO('yolo26l-pose.pt')"
-# 然后把下面这行改成对应文件（l 约 58 MB，x 约 126 MB）。
-weights = "models/yolo26m-pose.pt"
+#
+# 当前用 x（126 MB）：精度最好，但很贵。RTX 4060 Laptop 实测（含跟踪/点云/可视化
+# 的**全链路**）：imgsz 640 -> 约 70 ms/帧（~14 Hz），imgsz 512 -> 约 45 ms（~22 Hz）。
+# 本地三个权重：
+#   n   7.9 MB  全链路 ~9.6 ms  -> 60 fps 宽松
+#   m  49.0 MB  全链路 ~14.9 ms -> **能跑满 60 fps**（预算 16.7 ms）
+#   x 126.2 MB  全链路 ~70 ms   -> 只能 ~14 Hz，60 fps 做不到
+# 所以：想要 60 Hz 就把这行换成 m（或 n），并把 detect_hz 拉到 60；
+# 想要更准就保持 x，或把 imgsz 提到 768（代价约 1.4x）。
+# 下其他尺寸：cd models && uv run python -c "from ultralytics import YOLO; YOLO('yolo26l-pose.pt')"
+weights = "models/yolo26x-pose.pt"
 conf = 0.35
 imgsz = 640
 # "" = 有 CUDA 用 cuda:0，否则 cpu。
@@ -72,7 +81,9 @@ device = ""
 kpt_conf = 0.5
 
 [run]
-# 推理与可视化频率（相机更快时多余帧只取流不推理）。
+# 推理频率。**这是按模型实测能力设的，不是按相机 fps**：x 模型全链路约 70 ms/帧，
+# 所以设 15（实际会跑到 ~14 Hz）。相机仍然以 60 fps 取流，中间帧丢掉不推理。
+# 换 m/n 模型时把它拉到 60。
 detect_hz = 15.0
 # 限速容忍：帧到达时刻正好压在周期边界上时靠它避免白丢一半的帧（实测 15/15、30/15 都会）。
 rate_tolerance = 0.9
@@ -107,6 +118,11 @@ server_memory_limit = "512MB"
 jpeg_quality = 75
 # viewer 的端口；被占用时 rerun 会直接拿来用。
 port = 9876
+
+# 右上角面板。show_coords = 人体坐标（当前帧的坐标表 + 每个人的 X/Y/Z 曲线），
+# 默认取代了人数曲线；想要人数曲线就把 show_count 打开（两个都开也行）。
+show_coords = true
+show_count = false
 
 [pose3d]
 # 整个 3D 链路的总开关：关掉后不记 3D 骨架/轨迹/点云/深度图，也不输出世界坐标，

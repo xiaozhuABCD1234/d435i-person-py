@@ -32,6 +32,7 @@ from .config import (
     resolve_path,
 )
 from .geometry import pointcloud
+from .pose3d import landmarks
 from .track import PersonTracker
 from .world import CameraToWorld
 
@@ -155,6 +156,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="覆盖 [rerun].jpeg_quality：1-100，0 = 送原图（更吃内存）",
     )
+    p.add_argument(
+        "--coords-view",
+        dest="rerun_show_coords",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [rerun].show_coords：右上角的人体坐标表 + X/Y/Z 曲线（默认开）",
+    )
+    p.add_argument(
+        "--count-view",
+        dest="rerun_show_count",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 [rerun].show_count：右上角再放一条人数曲线（默认关）",
+    )
 
     pose3d_group = p.add_mutually_exclusive_group()
     pose3d_group.add_argument(
@@ -252,12 +267,15 @@ def print_settings(settings: Settings, config_path: str) -> None:
 def _person_record(person, world: CameraToWorld | None) -> dict:
     """一个人 -> 一行 JSON。世界坐标只在 [world] 开着时才有。"""
     position = person.position
+    points = landmarks(person)
     record = {
         "id": int(person.id),
         "conf": round(float(person.conf), 4),
         "distance": None if not np.isfinite(person.distance) else round(person.distance, 4),
         "cam": [round(float(v), 4) for v in position] if np.isfinite(position).all() else None,
         "world": None,
+        # 髀中点/肩中点/踝中点/鼻（相机系，米）；缺哪个关节就没有哪个键
+        "landmarks": {key: [round(float(v), 4) for v in point] for key, point in points.items()},
         "box": [round(float(v), 2) for v in person.box],
         "valid_keypoints": int(person.valid_count),
         "age": int(person.age),
@@ -367,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
             world=world,
             show_world_view=world is not None and settings.world_view,
             world_pointcloud=settings.world_pointcloud,
+            show_coords=settings.rerun_show_coords,
+            show_count=settings.rerun_show_count,
         )
         if rrd:
             print(f"rerun 记录 -> {rrd}")

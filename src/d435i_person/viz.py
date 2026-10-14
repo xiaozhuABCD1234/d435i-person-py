@@ -14,13 +14,17 @@
 ``camera/pose3d/{joints,skeleton}``  3D 骨架（真深度）
 ``camera/pose3d/trails``             每个人的运动轨迹
 ``camera/pose3d/positions``          每个人的 3D 位置（标签 = id + 距离）
-``world``                            世界系 3D 视图根（RIGHT_HAND_Z_UP，可选）
-``person/count``                     人数（TimeSeriesView 里的曲线）
+``world/...``                       世界系 3D 视图根（RIGHT_HAND_Z_UP，可选）
+``world/{points,joints,skeleton,trails,positions}``  世界系副本（刚体变换后）
+``person/table``                     人体坐标表（位置 + 髀/肩/踝/鼻，markdown）
+``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米）
+``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
-``person/table``                     当前每个人的 id/距离/世界坐标（markdown）
 ===================================  =======================================
 
-每个人的颜色由 id 决定（同一 id 在两块视图里同色），所以一眼就能看出谁是谁。
+右上角默认是**人体坐标**（上：当前帧的坐标表，下：每个人的 X/Y/Z 曲线），
+用 ``show_coords`` / ``show_count`` 控制（两个都开也行）。每个人的颜色由 id 决定，
+所以同一 id 在 2D 与 3D 里同色，一眼看得出谁是谁。
 
 进 rerun 前统一 `bgr_to_rgb()`：`rr.Image` 默认按 RGB 解读三通道数据，直接喂 BGR
 会红蓝互换。
@@ -34,6 +38,7 @@ import numpy as np
 
 from .colors import bgr_to_rgb
 from .pose import bones, visible_keypoints
+from .pose3d import landmarks
 
 # 按 id 轮转的颜色（RGB）。挑的是互相区分度高、在深色背景上也看得清的几种。
 PALETTE: tuple[tuple[int, int, int], ...] = (
@@ -53,6 +58,16 @@ JOINT_RADIUS = 0.02  # 米：关节球半径
 def color_for(person_id: int) -> tuple[int, int, int]:
     """同一个 id 永远同一个颜色（id 从 1 开始，单调递增）。"""
     return PALETTE[(int(person_id) - 1) % len(PALETTE)]
+
+
+def _format(point) -> str:
+    """``(3,)`` -> ``"x, y, z"``；None/nan/inf 一律给 ``-``。"""
+    if point is None:
+        return "-"
+    values = np.asarray(point, dtype=np.float64).reshape(-1)
+    if values.size != 3 or not np.isfinite(values).all():
+        return "-"
+    return f"{values[0]:.2f}, {values[1]:.2f}, {values[2]:.2f}"
 
 
 def _blueprint_module():
@@ -87,6 +102,8 @@ class RerunView:
         world=None,
         show_world_view: bool = False,
         world_pointcloud: bool = True,
+        show_coords: bool = True,
+        show_count: bool = False,
     ):
         """跑起来就弹 viewer（除非给了 save_path）。
 
@@ -109,6 +126,8 @@ class RerunView:
         self.world = world
         self.show_world_view = bool(show_world_view and world is not None)
         self.world_pointcloud = bool(world_pointcloud and world is not None)
+        self.show_coords = bool(show_coords)
+        self.show_count = bool(show_count)
         self._last_count: int | None = None
         self._image_size: tuple[int, int] | None = None
         self._coords_logged: set[str] = set()
@@ -146,22 +165,34 @@ class RerunView:
                     row_shares=[3, 2],
                 )
 
-            right_panels = [rrb.TimeSeriesView(origin="person/count", name="人数")]
-            shares = [1]
+            right_panels: list = []
+            shares: list[int] = []
+            if self.show_coords:
+                # 右上：人体坐标表（当前帧的具体数值）+ 每个人的 X/Y/Z 曲线
+                right_panels.append(
+                    rrb.Vertical(
+                        rrb.TextDocumentView(origin="person/table", name="人体坐标"),
+                        rrb.TimeSeriesView(origin="person/coords", name="坐标曲线"),
+                        row_shares=[3, 2],
+                    )
+                )
+                shares.append(2)
+            if self.show_count:
+                right_panels.append(rrb.TimeSeriesView(origin="person/count", name="人数"))
+                shares.append(1)
             if self.show_pose3d:
                 right_panels.append(self._make_3d_view(rrb, "camera/pose3d", "3D 骨架 / 点云"))
                 shares.append(3 if not self.show_world_view else 2)
             if self.show_world_view:
                 right_panels.append(self._make_3d_view(rrb, "world", "世界系"))
                 shares.append(2)
-            right = right_panels[0]
+
+            right = right_panels[0] if right_panels else None
             if len(right_panels) > 1:
                 right = rrb.Vertical(*right_panels, row_shares=shares)
 
-            blueprint = rrb.Blueprint(
-                rrb.Horizontal(left, right, column_shares=[3, 2]),
-                rrb.TimePanel(state="collapsed"),
-            )
+            library = rrb.Horizontal(left, right, column_shares=[3, 2]) if right else left
+            blueprint = rrb.Blueprint(library, rrb.TimePanel(state="collapsed"))
         except AttributeError:
             # blueprint API 不可用就用 rerun 的默认布局，不影响记录本身
             return
@@ -255,10 +286,17 @@ class RerunView:
                 ),
             )
 
-        # 人数只是几十字节的标量，一直带时间戳：右边那条曲线靠它画
+        # 人数只是几十字节的标量，一直带时间戳（曲线靠它画）；
+        # 每个人的坐标也一样：定时器面板之外就靠这两组标量看趋势。
         self._set_time(number)
         scalar = getattr(rr, "Scalars", None) or rr.Scalar
         rr.log("person/count", scalar(count))
+        if self.show_coords:
+            for person in live:
+                if not np.isfinite(person.position).all():
+                    continue
+                for axis, value in zip("xyz", person.position, strict=True):
+                    rr.log(f"person/coords/{person.id}/{axis}", scalar(float(value)))
         self._log_table(people, live)
 
     def _log_boxes(self, people) -> None:
@@ -316,31 +354,57 @@ class RerunView:
         self._log("camera/image/skeleton", rr.LineStrips2D(strips, colors=strip_colors))
 
     def _log_table(self, people, live) -> None:
-        """当前每个人的文字表：id / 置信度 / 距离 / 相机坐标 / 世界坐标。"""
+        """当前每个人的具体坐标：位置表 + 身体关键点表（markdown，直接看数值用）。
+
+        比曲线好在两点：一是**精确值**（悬停/截屏都能拿去用），二是能同时给出相机系和
+        世界系、以及髀/肩/踝/鼻这几个比"框中心"更有意义的点。
+        """
         rr = self.rr
         document = getattr(rr, "TextDocument", None)
         if document is None:  # pragma: no cover - 老版本没有 TextDocument
             return
-        rows = [
-            "| id | conf | 距离 m | 相机 xyz (m) | 世界 xyz (m) |",
+        lines = [
+            "**相机坐标系**：X 右 / Y 下 / Z 前（单位米）。",
+            "",
+            "### 人体位置",
+            "",
+            "| id | conf | 距离 | 相机 xyz | 世界 xyz |",
             "| --- | --- | --- | --- | --- |",
         ]
+        if not live:
+            lines.append("| - | - | - | - | - |")
         for person in live:
             cam = person.position
             if self.world is not None and np.isfinite(cam).all():
-                world = self.world.apply(cam)
-                world_text = f"{world[0]:.2f}, {world[1]:.2f}, {world[2]:.2f}"
+                world_text = _format(self.world.apply(cam))
             else:
-                world_text = "-"
-            rows.append(
+                world_text = "-" if self.world is None else "?"
+            lines.append(
                 f"| #{person.id} | {person.conf:.2f} | {person.distance:.2f} | "
-                f"{cam[0]:.2f}, {cam[1]:.2f}, {cam[2]:.2f} | {world_text} |"
+                f"{_format(cam)} | {world_text} |"
             )
+        if self.world is None:
+            lines += ["", "_世界坐标需要开 `[world].enabled`（安装高度/俯仰角）。_"]
+
+        lines += [
+            "",
+            "### 身体关键点（相机系，米）",
+            "",
+            "| id | 髀中点 | 肩中点 | 踝中点 | 鼻 |",
+            "| --- | --- | --- | --- | --- |",
+        ]
         if not live:
-            rows.append("| - | - | - | - | - |")
+            lines.append("| - | - | - | - | - |")
+        for person in live:
+            points = landmarks(person)
+            cells = " | ".join(
+                _format(points.get(key)) for key in ("hip", "shoulder", "ankle", "nose")
+            )
+            lines.append(f"| #{person.id} | {cells} |")
+
         media_type = getattr(rr, "MediaType", None)
         kwargs = {"media_type": media_type.MARKDOWN} if media_type is not None else {}
-        self._log("person/table", document("\n".join(rows), **kwargs))
+        self._log("person/table", document("\n".join(lines), **kwargs))
 
     # ---------------------------------------------------------------- 深度/点云
     def log_depth(self, depth: np.ndarray, *, max_width: int = 480) -> None:
