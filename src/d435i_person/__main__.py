@@ -197,6 +197,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖 [rerun].metrics_layout：格子/一框一行/全塞回一个框",
     )
     p.add_argument(
+        "--fall-light-flash",
+        type=float,
+        default=None,
+        help="覆盖 [rerun].fall_light_flash：摔倒报警灯闪烁频率 Hz（0 = 常亮不闪）",
+    )
+    p.add_argument(
         "--fall",
         dest="fall_enabled",
         action=argparse.BooleanOptionalAction,
@@ -440,6 +446,7 @@ def main(argv: list[str] | None = None) -> int:
             show_values=settings.rerun_show_values,
             metrics_views=settings.rerun_metrics_views,
             metrics_layout=settings.rerun_metrics_layout,
+            fall_light_flash=settings.rerun_fall_light_flash,
         )
         if rrd:
             print(f"rerun 记录 -> {rrd}")

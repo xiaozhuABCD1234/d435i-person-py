@@ -266,20 +266,30 @@ JSON Lines 里每人也多一个 `world` 字段。
 
 报警长什么样：
 
-- **「摔倒警报」框**（默认占右上角一个格子，取代了原来的“可信度”）：大字标题 + 报警的人
-  各一行 + 最近几条状态变化，人爬起来之后历史还在：
+- **「摔倒警报」灯**（默认占右上角一个格子，取代了原来的“可信度”）：**一格 2D 视图，
+  一整块颜色 + 白字**——颜色是屏幕上最先被看见的东西，也没有表情符号：
+
+  | 状态 | 颜色 | 文字 |
+  | --- | --- | --- |
+  | 摔倒（level 2） | **红**（和“整个人变红”同一个色，**2 Hz 闪烁**） | `摔倒 #1` |
+  | 疑似倒地（有冲击/正在倒地） | 琥珀 | `疑似倒地 #2` |
+  | 正常 | 绿 | `正常` |
+  | 画面内无人 | 暗蓝灰（故意不用绿：没人在 ≠ 一切正常） | `画面内无人` |
+
+  红字下面跟着明细行（躯干角 / 距离 / 已经多久）与最近两条状态变化，人爬起来后历史还在：
 
   ```
-  # ⚠ 摔倒 #1
-  - #1 · 摔倒 · 躯干 90° · 距 4.1 m · 已 0.3 s
-
-  最近：4.3s #1 疑似摔倒 / 倒地中（躯干 52°）；5.7s ⚠ #1 检测到摔倒（躯干 90°）
+  摔倒 #1
+  #1 · 躯干 90° · 距 4.1 m · 已 0.3 s
+  最近 5.7s #1 检测到摔倒（躯干 90°）；9.5s #1 已恢复正常
   ```
 
-  没报警时就是一行 `# ✅ 正常`（画面内无人时是 `# ✅ 画面内无人`），所以框不会空着，
-  也看得出监控在跑。
+  闪烁频率用 `[rerun].fall_light_flash`（Hz，默认 2.0；0 = 常亮）。闪烁靠“每帧重新记一次
+  颜色”实现，所以 `keep_history = false` 的 static 记录也照样闪。同一格里还有一份纯文本
+  副本 `person/fall_alert`（可选中/可复制，内容同源）。
 - **人变红**：2D 框/关键点/骨骰与 3D 位置、轨迹都换 `ALARM_COLOR`（比“去某个框里找条线”快）
-- 数值行首部插 `⚠ 摔倒 89°`（确认前只写“倒地中”；仅挨一下冲击的正常动作不插）
+- 数值行首部插 `⚠ 摔倒 89°`（确认前只写“倒地中”；仅挨一下冲击的正常动作不插）——
+  数值行与 3D 标签的 `⚠` 保留，报警灯那格不用任何表情符号
 - `person/metrics/fall/fall_level/<id>` 与 `torso_angle/<id>` 两条曲线，`person/fall` 记状态变化的文本日志
 
 已知边界（写在模块 docstring 里，不藏）：
@@ -305,8 +315,9 @@ uv run d435i-person --metrics-views fall   # 只看摔倒那两条曲线
 | `camera/pose3d/trails` `positions` | 轨迹、每人 3D 位置（短标签带距离与速度） |
 | `world/...` | 世界系视图（`[world].enabled` 时才记） |
 | `person/metrics/<组>/<指标>/<id>` | **人体指标曲线**，按组拆框：`speed` 速度、`size` 高/肩/髀、`length` 躯干/腿/臂展、`gait` 步频/步幅、`fall` 摔倒（躯干角/等级）、`quality` coverage |
-| `person/fall_alert` | **摔倒警报框**（大字文本：⚠ 摔倒 / ⏳ 倒地中 / ✅ 正常） |
-| `person/fall` | 摔倒状态变化日志（只在跳变时记一条） |
+| `person/fall_light` | **摔倒报警灯**（一格 2D：红=摔倒（2 Hz 闪）/ 琥珀=疑似倒地 / 绿=正常 / 暗蓝灰=无人）|
+| `person/fall_alert` | 报警灯的纯文本副本（markdown，可选中复制）|
+| `person/fall` | 摔倒状态变化日志（只在跳变时记一条）|
 | `person/values` | 每人一行极简数值（短文本，见下方"数值行"） |
 | `person/coords/<id>/{x,y,z}` | 坐标曲线（相机系，默认关） |
 | `person/count` | 人数标量（数据一直在，只是默认不占面板） |
@@ -325,17 +336,18 @@ uv run d435i-person --metrics-views fall   # 只看摔倒那两条曲线
 | `length` | `torso`、`leg`、`arm_span` |
 | `gait` | `cadence`、`stride` |
 | `fall` | `fall_level`（0/1/2）、`torso_angle`（度）|
-| `alarm` | **摔倒警报框（大字文本，不是曲线）**：`⚠ 摔倒 #1` / `⏳ 倒地中 #2` / `✅ 正常`，下面接报警的人各一行与最近几条状态变化 |
+| `alarm` | **摔倒报警灯（2D 色块，不是曲线）**：红=摔倒（闪）/ 琥珀=疑似倒地 / 绿=正常 / 暗蓝灰=无人，格内附明细行与最近两条状态变化 |
 | `quality` | `coverage`（有效关节比例）。**默认不占格子**（数据照记），想要回来就 `--metrics-views all,quality` |
 
 ```bash
-uv run d435i-person                             # 默认：5 个曲线框 + 摔倒警报框（3×2 格子）
+uv run d435i-person                             # 默认：5 个曲线框 + 摔倒报警灯（3×2 格子）
 uv run d435i-person --metrics-views speed,size     # 只看速度与尺寸
-uv run d435i-person --metrics-views fall,alarm     # 只看摔倒曲线 + 警报框
+uv run d435i-person --metrics-views fall,alarm     # 只看摔倒曲线 + 报警灯
 uv run d435i-person --metrics-views all,quality    # 再加回 coverage 格子
 uv run d435i-person --metrics-views height         # 只给身高一个框
 uv run d435i-person --metrics-layout stack         # 一框一行地堆
 uv run d435i-person --metrics-layout single        # 回到“一个大框全在里面”
+uv run d435i-person --fall-light-flash 0           # 报警灯常亮，不闪
 ```
 
 故意的：**没有大段文字**。数值行是每人一行、只列本帧真有的项：
@@ -347,7 +359,8 @@ uv run d435i-person --metrics-layout single        # 回到“一个大框全在
 
 面板用 `[rerun]` 的 `show_metrics` / `show_values` / `show_coords` / `show_count` 开关，
 指标框的组成与摆法用 `metrics_views` / `metrics_layout`（两个都有对应的 `--metrics-views` /
-`--metrics-layout` 临时覆盖）；
+`--metrics-layout` 临时覆盖），摔倒报警灯的闪烁用 `fall_light_flash`（Hz，0 = 常亮，
+对应 `--fall-light-flash`）；
 曲线默认是**相机坐标系**（X 右 / Y 下 / Z 前），开了 `[world]` 后曲线轴含义不变，
 但指标里的"上方向"已经换成了世界 Z（所以身高不受镜头俯仰影响）。
 
@@ -473,6 +486,7 @@ uv run python tools/check_camera.py --frames 60              # 只看相机侧�
 | 摔倒没报 | 先确认 `[fall].enabled`（`--show-config | grep fall`）；人得站得比较完整（高度兼底判据需先学到站立参考，开跑前几秒得是站着的）；真躺着但没位移/速度（被人慢慢放下）本质上报不了 |
 | “疑似摔倒”一直亮着 | 人在持续跳/快速蹲起时会出现（只到 1 级、不报警）；不想要这个显示就把 `fall_alert()` 里那一支去掉 |
 | 右上角看不到坐标/指标曲线 | 坐标曲线需 `[rerun].show_coords = true`（默认关）；指标曲线看 `show_metrics` 与 `metrics_views` |
+| 报警灯一直在闪，看久了烦 | `--fall-light-flash 0`（常亮）或调慢（如 `1.0`）；不想让报警的人整体变红就不改 `person_color()` |
 | 指标框太多/太空（不走路就没步态曲线） | `--metrics-views speed,size` 只留要看的组，或 `--metrics-layout single` 换回一个大框 |
 | 3D 骨架"呼吸"/抖 | 提高 `[pose3d].kalman_measurement`（更平滑），或开 `--temporal` 深度滤镜 |
 | 两个人换 id | 调大 `[track].iou_threshold`，或设 `match_max_distance = 1.0`（米） |

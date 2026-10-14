@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from d435i_person.camera import Frame
+from d435i_person.fall import FALLEN, NORMAL, SUSPECT
 from d435i_person.geometry import Intrinsics, pointcloud
 from d435i_person.pose import NUM_KEYPOINTS, PoseInstance
 from d435i_person.track import PersonTracker
@@ -16,11 +17,15 @@ from d435i_person.viz import (
     ALARM_COLOR,
     ALARM_ORIGIN,
     DEFAULT_METRIC_GROUPS,
+    LIGHT_COLORS,
+    LIGHT_FLASH_DIM,
+    LIGHT_IDLE_COLOR,
     PALETTE,
     RerunView,
     color_for,
     fall_alert,
     fall_alert_panel,
+    fall_light,
     person_color,
     value_line,
 )
@@ -112,22 +117,23 @@ def test_alarm_box_replaces_coverage_in_the_default_grid() -> None:
 
 
 def test_fall_alert_panel_states() -> None:
+    """纯文本副本：不带表情符号；正常/无人是安静的小字，不是大字标题。"""
     people = make_people()
-    assert "画面内无人" in fall_alert_panel([])
-    assert "✅ 正常" in fall_alert_panel(people)
+    assert fall_alert_panel([]) == "画面内无人"
+    assert fall_alert_panel(people) == "正常"
 
     person = people[0]
     person.metrics["torso_angle"] = 88.6
-    person.fall_level, person.lying, person.fall_since = 1, True, 10.0
+    person.fall_level, person.lying, person.fall_since = SUSPECT, True, 10.0
     down = fall_alert_panel(people, now=12.5)
-    assert down.startswith("# ⏳ 倒地中 #")
+    assert down.startswith("# 疑似倒地 #")
     assert "躯干 89°" in down and "已 2.5 s" in down
 
-    person.fall_level, person.fall_state = 2, "摔倒"
-    alarm = fall_alert_panel(people, history=["10.2s ⚠ #1 检测到摔倒"], now=12.5)
-    assert alarm.startswith("# ⚠ 摔倒 #")
+    person.fall_level, person.fall_state = FALLEN, "摔倒"
+    alarm = fall_alert_panel(people, history=["10.2s #1 检测到摔倒"], now=12.5)
+    assert alarm.startswith("# 摔倒 #")
     assert "摔倒 ·" in alarm  # 状态名跟在 id 后面
-    assert "最近：10.2s ⚠ #1 检测到摔倒" in alarm
+    assert "最近：10.2s #1 检测到摔倒" in alarm
     assert "倒地中" not in alarm.split("\n")[1]  # 确认后不再写“倒地中”
 
 
@@ -135,11 +141,48 @@ def test_fall_alert_panel_marks_multiple_people() -> None:
     first, second = make_people()[0], make_people()[0]
     second.id = first.id + 1
     for person in (first, second):
-        person.fall_level = 2
+        person.fall_level = FALLEN
         person.fall_state = "摔倒"
     panel = fall_alert_panel([first, second])
-    assert "⚠ 摔倒" in panel and "（多人）" in panel
+    assert "摔倒" in panel and "（多人）" in panel
     assert len([line for line in panel.split("\n") if line.startswith("- ")]) == 2
+
+
+def test_fall_light_colors_by_level() -> None:
+    """报警灯四档颜色：红=摔倒 / 琥珀=疑似倒地 / 绿=正常 / 暗蓝灰=无人。"""
+    people = make_people()
+    assert fall_light([]) == (LIGHT_IDLE_COLOR, ["画面内无人"])
+
+    color, lines = fall_light(people, now=1.0)
+    assert color == LIGHT_COLORS[NORMAL] and lines[0] == "正常"
+
+    person = people[0]
+    person.metrics["torso_angle"] = 71.4
+    person.fall_level, person.lying, person.fall_since = SUSPECT, True, 10.0
+    color, lines = fall_light(people, history=["10.2s #1 疑似摔倒"], now=12.5)
+    assert color == LIGHT_COLORS[SUSPECT] and lines[0] == "疑似倒地 #1"
+    assert lines[1] == "#1 · 躯干 71° · 距 2.0 m · 已 2.5 s"  # 明细行不重复状态名
+    assert lines[2] == "最近 10.2s #1 疑似摔倒"
+
+    person.fall_level, person.fall_state = FALLEN, "摔倒"
+    color, lines = fall_light(people, now=13.0)  # 13×2 是偶数 -> 亮相位
+    assert color == LIGHT_COLORS[FALLEN] and lines[0] == "摔倒 #1"
+
+
+def test_fall_light_flashes_only_when_fallen() -> None:
+    """红灯按 flash_hz 明暗交替（报警灯就该闪）；其余档位常亮，0 则常亮不闪。"""
+    person = make_people()[0]
+    person.fall_level, person.fall_state = FALLEN, "摔倒"
+    bright = LIGHT_COLORS[FALLEN]
+    dim = tuple(int(c * LIGHT_FLASH_DIM) for c in LIGHT_COLORS[FALLEN])
+    # 2 Hz：每 0.5 s 换一次相位
+    assert fall_light([person], now=0.1)[0] == bright
+    assert fall_light([person], now=0.6)[0] == dim
+    assert fall_light([person], now=1.1)[0] == bright
+    assert fall_light([person], now=0.6, flash_hz=0.0)[0] == bright  # 0 = 常亮
+
+    person.fall_level, person.lying = SUSPECT, True
+    assert fall_light([person], now=0.6)[0] == LIGHT_COLORS[SUSPECT]  # 琥珀不闪
 
 
 def test_log_frame_writes_an_rrd(tmp_path: Path) -> None:

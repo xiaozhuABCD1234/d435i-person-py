@@ -21,7 +21,8 @@
 ``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米，默认关）
 ``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
-``person/fall_alert``                摔倒警报框（大字文本：⚠ 摔倒 / 倒地中 / ✅ 正常）
+``person/fall_light``                摔倒报警灯（一格 2D：红=摔倒（会闪）/ 琥珀=疑似倒地 / 绿=正常）
+``person/fall_alert``                报警灯的纯文本副本（markdown，可选中复制）
 ``person/fall``                      摔倒状态变化日志（只在跳变时记一条）
 ===================================  =======================================
 
@@ -44,6 +45,7 @@ from collections import deque
 import numpy as np
 
 from .colors import bgr_to_rgb
+from .fall import FALLEN, NORMAL, SUSPECT
 from .pose import bones, visible_keypoints
 
 # 按 id 轮转的颜色（RGB）。挑的是互相区分度高、在深色背景上也看得清的几种。
@@ -60,6 +62,23 @@ PALETTE: tuple[tuple[int, int, int], ...] = (
 POSITION_RADIUS = 0.04  # 米：3D 位置球半径
 JOINT_RADIUS = 0.02  # 米：关节球半径
 ALARM_COLOR = (255, 64, 64)  # 摔倒报警色（2D/3D 都换成它，比“看曲线”快得多）
+
+# 摔倒报警灯：占「摔倒警报」那一格（2D 视图：整格一块颜色 + 白字）。
+# 用颜色而不是表情符号：颜色是屏幕上最先被看见的东西，也不会有字体缺字的问题。
+LIGHT_ORIGIN = "person/fall_light"
+LIGHT_BG = f"{LIGHT_ORIGIN}/bg"  # 底色，让色块边缘有边界
+LIGHT_STATE = f"{LIGHT_ORIGIN}/state"  # 状态灯那块颜色
+LIGHT_TEXT = f"{LIGHT_ORIGIN}/text"  # 状态与明细（2D 标签：屏幕像素大小，格子小也看得清）
+LIGHT_COLORS: dict[int, tuple[int, int, int]] = {
+    NORMAL: (48, 200, 96),  # 绿：正常
+    SUSPECT: (255, 176, 32),  # 琥珀：疑似倒地
+    FALLEN: (255, 64, 64),  # 红：摔倒（跟“整个人变红”同一个色）
+}
+LIGHT_IDLE_COLOR = (90, 100, 120)  # 画面内无人：暗蓝灰（故意不用绿——没人在 ≠ 一切正常）
+LIGHT_BG_COLOR = (32, 34, 38)
+LIGHT_TEXT_COLOR = (235, 235, 235)
+LIGHT_FLASH_DIM = 0.35  # 闪烁的暗相位保留多少亮度（还看得出是红灯）
+ALERT_TEXT_ORIGIN = "person/fall_alert"  # 纯文本副本（可选中/可复制，记着不花什么钱）
 
 
 def color_for(person_id: int) -> tuple[int, int, int]:
@@ -107,11 +126,11 @@ METRIC_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("quality", "可信度", ("coverage",)),
 )
 
-# 摔倒警报框：不是曲线（曲线要去找），而是把当前警报写成大字文本。
+# 摔倒警报：不是曲线（曲线要去找），而是报警灯——整格一块颜色 + 白字。
 # 默认占一个格子（取代原来的“可信度”）：报警要一眼看到。coverage 曲线照记，
 # 想要回那个格子就把它写进 metrics_views（"all,quality"）。
 ALARM_GROUP = "alarm"
-ALARM_ORIGIN = "person/fall_alert"
+ALARM_ORIGIN = LIGHT_ORIGIN  # 那一格记的是报警灯（person/fall_light）
 ALARM_LABEL = "摔倒警报"
 
 # 指标 -> 组；没列进去的新指标落到 "other"（数据照记，只是没预置视图）。
@@ -197,10 +216,15 @@ def value_line(person) -> str:
     return " · ".join(parts)
 
 
-def _fall_detail(person, now: float | None = None) -> str:
-    """警报框里的一行：谁、什么状态、躯干多横、多远、已经多久了。"""
+def _fall_detail(person, now: float | None = None, *, with_state: bool = True) -> str:
+    """警报里的一行：谁、什么状态、躯干多横、多远、已经多久了。
+
+    ``with_state=False`` 时省掉状态名（报警灯标题里已经写了，明细行重复就啰嗦）。
+    """
     level = int(getattr(person, "fall_level", 0))
-    parts = [f"#{person.id}", person.fall_state if level >= 2 else "倒地中"]
+    parts = [f"#{person.id}"]
+    if with_state:
+        parts.append(person.fall_state if level >= 2 else "倒地中")
     angle = person.metrics.get("torso_angle")
     if angle is not None and np.isfinite(angle):
         parts.append(f"躯干 {angle:.0f}°")
@@ -212,26 +236,67 @@ def _fall_detail(person, now: float | None = None) -> str:
     return " · ".join(parts)
 
 
-def fall_alert_panel(people, history=(), now: float | None = None) -> str:
-    """摔倒警报框的文本：大字标题 + 报警的人各一行 + 最近几条状态变化。
+def fall_light(
+    people, history=(), now: float | None = None, *, flash_hz: float = 2.0
+) -> tuple[tuple[int, int, int], list[str]]:
+    """报警灯：返回 (颜色, 文字行)。纯函数，不依赖 rerun，方便单测。
 
-    单独拎出来是为了可测（不依赖 rerun）。用文本而不是曲线：报警就该一眼看到，
-    而不是让人去某个曲线框里找哪条线翘起来了。
+    四档颜色：红（摔倒）/ 琥珀（疑似倒地）/ 绿（正常）/ 暗蓝灰（画面内无人）。
+    ``flash_hz`` > 0 时红灯按这个频率明暗交替——报警灯就该闪；其余档位常亮。
     """
     alive = list(people)
-    alarmed = [p for p in alive if int(getattr(p, "fall_level", 0)) >= 2]
+    alarmed = [p for p in alive if int(getattr(p, "fall_level", 0)) >= FALLEN]
     down = [
-        p for p in alive if int(getattr(p, "fall_level", 0)) == 1 and getattr(p, "lying", False)
+        p
+        for p in alive
+        if int(getattr(p, "fall_level", 0)) == SUSPECT and getattr(p, "lying", False)
     ]
     if alarmed:
         who = "、".join(f"#{p.id}" for p in alarmed)
-        head = f"# ⚠ 摔倒 {who}" + ("（多人）" if len(alarmed) > 1 else "")
+        head = f"摔倒 {who}" + ("（多人）" if len(alarmed) > 1 else "")
+        color = LIGHT_COLORS[FALLEN]
     elif down:
-        head = "# ⏳ 倒地中 " + "、".join(f"#{p.id}" for p in down)
+        head = "疑似倒地 " + "、".join(f"#{p.id}" for p in down)
+        color = LIGHT_COLORS[SUSPECT]
     elif alive:
-        head = "# ✅ 正常"
+        head, color = "正常", LIGHT_COLORS[NORMAL]
     else:
-        head = "# ✅ 画面内无人"
+        head, color = "画面内无人", LIGHT_IDLE_COLOR
+    if (
+        color is LIGHT_COLORS[FALLEN]
+        and flash_hz > 0
+        and now is not None
+        and int(now * flash_hz) % 2
+    ):
+        color = tuple(int(c * LIGHT_FLASH_DIM) for c in color)  # 暗相位：暗下去但还看得出是红的
+    lines = [head, *(_fall_detail(p, now, with_state=False) for p in [*alarmed, *down])]
+    if history:
+        lines.append("最近 " + "；".join(list(history)[-2:]))
+    return color, lines
+
+
+def fall_alert_panel(people, history=(), now: float | None = None) -> str:
+    """报警灯的纯文本副本：标题 + 报警的人各一行 + 最近几条状态变化。
+
+    报警灯（2D 色块）是给眼睛看的，这份文本是给“选中/复制/搜索”用的——两者内容同源。
+    单独拎出来也是为了可测（不依赖 rerun）。
+    """
+    alive = list(people)
+    alarmed = [p for p in alive if int(getattr(p, "fall_level", 0)) >= FALLEN]
+    down = [
+        p
+        for p in alive
+        if int(getattr(p, "fall_level", 0)) == SUSPECT and getattr(p, "lying", False)
+    ]
+    if alarmed:
+        who = "、".join(f"#{p.id}" for p in alarmed)
+        head = f"# 摔倒 {who}" + ("（多人）" if len(alarmed) > 1 else "")
+    elif down:
+        head = "# 疑似倒地 " + "、".join(f"#{p.id}" for p in down)
+    elif alive:
+        head = "正常"
+    else:
+        head = "画面内无人"
     lines = [head, *(f"- {_fall_detail(person, now)}" for person in [*alarmed, *down])]
     if history:
         lines += ["", "最近：" + "；".join(history)]
@@ -276,6 +341,7 @@ class RerunView:
         show_values: bool = True,
         metrics_views: str = "all",
         metrics_layout: str = "grid",
+        fall_light_flash: float = 2.0,
     ):
         """跑起来就弹 viewer（除非给了 save_path）。
 
@@ -308,6 +374,8 @@ class RerunView:
         self.metrics_layout = (
             metrics_layout if metrics_layout in {"grid", "stack", "single"} else "grid"
         )
+        # 报警灯闪烁频率（Hz）：红灯明暗交替；0 = 常亮
+        self.fall_light_flash = max(float(fall_light_flash), 0.0)
         self._last_count: int | None = None
         self._image_size: tuple[int, int] | None = None
         self._coords_logged: set[str] = set()
@@ -396,7 +464,7 @@ class RerunView:
         """
         picked = self.metric_views or _parse_metric_views("all")
         views = [
-            rrb.TextDocumentView(origin=origin, name=name)
+            self._alarm_view(rrb, origin, name)
             if group == ALARM_GROUP
             else rrb.TimeSeriesView(origin=origin, name=name)
             for origin, name, group in picked
@@ -412,6 +480,22 @@ class RerunView:
         if grid is None:  # pragma: no cover - 老版本没有 Grid
             return rrb.Vertical(*views)
         return grid(*views)
+
+    def _alarm_view(self, rrb, origin: str, name: str):
+        """报警灯那一格：2D 视图，坐标系锁在单位方格上。
+
+        不锁的话 rerun 会按内容自动取景，色块在格子里的位置会跟着内容漂；锁成 [0,1]²
+        后色块就是“整格一块颜色”，和报警灯的样子一致。
+        """
+        bounds = getattr(rrb, "VisualBounds2D", None)
+        if bounds is not None:
+            with contextlib.suppress(Exception):  # 老版本没有 visual_bounds
+                return rrb.Spatial2DView(
+                    origin=origin,
+                    name=name,
+                    visual_bounds=bounds(x_range=[0.0, 1.0], y_range=[0.0, 1.0]),
+                )
+        return rrb.Spatial2DView(origin=origin, name=name)
 
     def _make_3d_view(self, rrb, origin: str, name: str):
         """3D 视图，眼位钉在相机坐标系的默认位置。
@@ -529,6 +613,7 @@ class RerunView:
                 ),
             )
         self._log_fall_events(live, frame.host_time)
+        self._log_fall_light(live, frame.host_time)
         self._log_fall_alert(live, frame.host_time)
 
         # 标量一直带时间戳（曲线靠它们画）：人数、人体指标、以及每个人的位置坐标。
@@ -608,6 +693,7 @@ class RerunView:
         """摔倒状态一变就记一条 TextLog（rerun 的文本日志面板里能看到整串时间线）。
 
         只在跳变时记，不是每帧都记：报警从“倒地中”到“摔倒”再到“已恢复”一共就几条。
+        文案不带表情符号（这些字会跟着“最近”进报警灯那一格，那格要求无表情）。
         """
         rr = self.rr
         for person in live:
@@ -617,19 +703,47 @@ class RerunView:
             self._fall_levels[person.id] = level
             angle = person.metrics.get("torso_angle")
             detail = f"（躯干 {angle:.0f}°）" if angle is not None and np.isfinite(angle) else ""
-            if level >= 2:
-                text = f"⚠ #{person.id} 检测到摔倒{detail}"
-            elif level == 1:
+            if level >= FALLEN:
+                text = f"#{person.id} 检测到摔倒{detail}"
+            elif level == SUSPECT:
                 text = f"#{person.id} 疑似摔倒 / 倒地中{detail}"
             else:
                 text = f"#{person.id} 已恢复正常"
             self._fall_history.append(f"{t:.1f}s {text}")
             self._log("person/fall", rr.TextLog(text))
 
-    def _log_fall_alert(self, live, t: float) -> None:
-        """摔倒警报框：把当前警报写成大字文本（不是曲线）。
+    def _log_fall_light(self, live, t: float) -> None:
+        """摔倒报警灯：一格 2D 视图里画一块颜色 + 白字（不再是表情符号）。
 
-        没报警时也记（内容就一行“正常”），这样框不会空着，也看得出“监控在跑”。
+        红=摔倒（还会闪）/ 琥珀=疑似倒地 / 绿=正常 / 暗蓝灰=画面内无人。闪烁靠“每帧重新
+        记一次颜色”实现，所以 keep_history=False 的 static 记录也照样闪。
+        """
+        rr = self.rr
+        boxes = getattr(rr, "Boxes2D", None)
+        points = getattr(rr, "Points2D", None)
+        if boxes is None or points is None:  # pragma: no cover - 老版本
+            return
+        color, lines = fall_light(live, self._fall_history, t, flash_hz=self.fall_light_flash)
+        # Boxes2D 本身就填色，没有 fill_mode 参数（这个版本的签名里没有）
+        self._log(
+            LIGHT_BG, boxes(centers=[[0.5, 0.5]], sizes=[[1.0, 1.0]], colors=[LIGHT_BG_COLOR])
+        )
+        self._log(LIGHT_STATE, boxes(centers=[[0.5, 0.74]], sizes=[[0.86, 0.18]], colors=[color]))
+        # 2D 标签的文字是屏幕像素大小：格子缩小也不会看不见（不像图像里的字会跟着缩）
+        self._log(
+            LIGHT_TEXT,
+            points(
+                positions=[[0.07, 0.46]],
+                labels=["\n".join(lines)],
+                colors=[LIGHT_TEXT_COLOR],
+                radii=[0.004],
+            ),
+        )
+
+    def _log_fall_alert(self, live, t: float) -> None:
+        """报警灯的纯文本副本（markdown）：报警灯是给眼睛看的，这份给“选中/复制”用。
+
+        成本几乎为零（static，只保留最新一份），但少了它就没法把状态整段复制出来。
         """
         document = getattr(self.rr, "TextDocument", None)
         if document is None:  # pragma: no cover - 老版本没有 TextDocument
@@ -637,7 +751,7 @@ class RerunView:
         media_type = getattr(self.rr, "MediaType", None)
         kwargs = {"media_type": media_type.MARKDOWN} if media_type is not None else {}
         text = fall_alert_panel(live, self._fall_history, t)
-        self._log(ALARM_ORIGIN, document(text, **kwargs))
+        self._log(ALERT_TEXT_ORIGIN, document(text, **kwargs))
 
     def _log_values(self, live) -> None:
         """极简数值行：每人一行短文本（距/速/身高/肩宽/髀宽/步频/步幅）。

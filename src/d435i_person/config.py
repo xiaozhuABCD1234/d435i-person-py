@@ -87,6 +87,8 @@ class Settings:
     #   grid = 格子（默认，一行放得下就几个）；stack = 一框一行地堆；single = 全塞回一个框
     rerun_metrics_views: str = "all"
     rerun_metrics_layout: str = "grid"
+    # 摔倒报警灯的闪烁频率（Hz）：红灯明暗交替，0 = 常亮
+    rerun_fall_light_flash: float = 2.0
 
     # -------------------------------------------------------------- [metrics]
     # 人体指标（速度/步态/尺寸）。关掉就少算一点，也不记 person/metrics/*。
@@ -201,6 +203,7 @@ CONFIG_FIELDS: dict[tuple[str, str], str] = {
     ("rerun", "show_values"): "rerun_show_values",
     ("rerun", "metrics_views"): "rerun_metrics_views",
     ("rerun", "metrics_layout"): "rerun_metrics_layout",
+    ("rerun", "fall_light_flash"): "rerun_fall_light_flash",
     ("metrics", "enabled"): "metrics_enabled",
     ("metrics", "speed_smoothing"): "speed_smoothing",
     ("metrics", "speed_deadband"): "speed_deadband",

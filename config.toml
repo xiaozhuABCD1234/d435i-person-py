@@ -131,17 +131,19 @@ port = 9876
 #   length  长度（torso / leg / arm_span）
 #   gait    步态（cadence / stride）
 #   fall    摔倒曲线（fall_level / torso_angle）
-#   alarm   摔倒警报（大字文本：⚠ 摔倒 / ⏳ 倒地中 / ✅ 正常）——默认占一个格子
+#   alarm   摔倒报警灯（一格 2D：红=摔倒（会闪）/ 琥珀=疑似倒地 / 绿=正常 / 灰=无人）
 #   quality 可信度（coverage = 有效关节比例）——默认不占格子，数据照记
 # "all" = 上面除 quality 外全部；也可只挑几个（"speed,size,alarm"），或直接写单个
 # 指标名（"height"）；想把 coverage 格子加回来就写 "all,quality"。
 # metrics_layout：grid = 格子（默认）；stack = 一框一行地堆；single = 全塞回一个框。
+# fall_light_flash：报警灯闪烁频率（Hz）；红灯明暗交替，0 = 常亮不闪。
 show_metrics = true
 show_values = true
 show_coords = false
 show_count = false
 metrics_views = "all"
 metrics_layout = "grid"
+fall_light_flash = 2.0
 
 [metrics]
 # 人体指标：速度、步态（步频/步幅）、尺寸（身高/肩宽/髀宽/腿长/臂展）。
