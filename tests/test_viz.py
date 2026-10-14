@@ -14,12 +14,18 @@ from d435i_person.pose import NUM_KEYPOINTS, PoseInstance
 from d435i_person.track import PersonTracker
 from d435i_person.viz import (
     ALARM_COLOR,
+    ALARM_ORIGIN,
+    DEFAULT_METRIC_GROUPS,
     PALETTE,
     RerunView,
     color_for,
     fall_alert,
+    fall_alert_panel,
     person_color,
     value_line,
+)
+from d435i_person.viz import (
+    _parse_metric_views as parse_metric_views,
 )
 from d435i_person.world import CameraToWorld
 
@@ -89,6 +95,51 @@ def test_fallen_person_turns_red_and_is_flagged() -> None:
     assert fall_alert(person) == "⚠ 摔倒 89°"
     assert person_color(person) == ALARM_COLOR
     assert "⚠ 摔倒" in value_line(person)
+
+
+def test_alarm_box_replaces_coverage_in_the_default_grid() -> None:
+    """默认格子：五个曲线组 + 摔倒警报，coverage 不再占格子（数据照记）。"""
+    origins = [origin for origin, _, _ in parse_metric_views("all")]
+    assert ALARM_ORIGIN in origins
+    assert len(origins) == len(DEFAULT_METRIC_GROUPS)
+    assert all("quality" not in origin for origin in origins)
+    assert parse_metric_views("quality")[0][0] == "person/metrics/quality"  # 仍可单独要
+    assert "person/metrics/quality" in [o for o, _, _ in parse_metric_views("all,quality")]
+    assert parse_metric_views("speed,alarm") == [
+        ("person/metrics/speed", "速度", "speed"),
+        (ALARM_ORIGIN, "摔倒警报", "alarm"),
+    ]
+
+
+def test_fall_alert_panel_states() -> None:
+    people = make_people()
+    assert "画面内无人" in fall_alert_panel([])
+    assert "✅ 正常" in fall_alert_panel(people)
+
+    person = people[0]
+    person.metrics["torso_angle"] = 88.6
+    person.fall_level, person.lying, person.fall_since = 1, True, 10.0
+    down = fall_alert_panel(people, now=12.5)
+    assert down.startswith("# ⏳ 倒地中 #")
+    assert "躯干 89°" in down and "已 2.5 s" in down
+
+    person.fall_level, person.fall_state = 2, "摔倒"
+    alarm = fall_alert_panel(people, history=["10.2s ⚠ #1 检测到摔倒"], now=12.5)
+    assert alarm.startswith("# ⚠ 摔倒 #")
+    assert "摔倒 ·" in alarm  # 状态名跟在 id 后面
+    assert "最近：10.2s ⚠ #1 检测到摔倒" in alarm
+    assert "倒地中" not in alarm.split("\n")[1]  # 确认后不再写“倒地中”
+
+
+def test_fall_alert_panel_marks_multiple_people() -> None:
+    first, second = make_people()[0], make_people()[0]
+    second.id = first.id + 1
+    for person in (first, second):
+        person.fall_level = 2
+        person.fall_state = "摔倒"
+    panel = fall_alert_panel([first, second])
+    assert "⚠ 摔倒" in panel and "（多人）" in panel
+    assert len([line for line in panel.split("\n") if line.startswith("- ")]) == 2
 
 
 def test_log_frame_writes_an_rrd(tmp_path: Path) -> None:

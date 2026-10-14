@@ -266,8 +266,20 @@ JSON Lines 里每人也多一个 `world` 字段。
 
 报警长什么样：
 
+- **「摔倒警报」框**（默认占右上角一个格子，取代了原来的“可信度”）：大字标题 + 报警的人
+  各一行 + 最近几条状态变化，人爬起来之后历史还在：
+
+  ```
+  # ⚠ 摔倒 #1
+  - #1 · 摔倒 · 躯干 90° · 距 4.1 m · 已 0.3 s
+
+  最近：4.3s #1 疑似摔倒 / 倒地中（躯干 52°）；5.7s ⚠ #1 检测到摔倒（躯干 90°）
+  ```
+
+  没报警时就是一行 `# ✅ 正常`（画面内无人时是 `# ✅ 画面内无人`），所以框不会空着，
+  也看得出监控在跑。
 - **人变红**：2D 框/关键点/骨骰与 3D 位置、轨迹都换 `ALARM_COLOR`（比“去某个框里找条线”快）
-- 数值行首部插 `⚠ 摔倒`（确认前只是“倒地中”；仅挨一下冲击的正常动作不插）
+- 数值行首部插 `⚠ 摔倒 89°`（确认前只写“倒地中”；仅挨一下冲击的正常动作不插）
 - `person/metrics/fall/fall_level/<id>` 与 `torso_angle/<id>` 两条曲线，`person/fall` 记状态变化的文本日志
 
 已知边界（写在模块 docstring 里，不藏）：
@@ -293,6 +305,8 @@ uv run d435i-person --metrics-views fall   # 只看摔倒那两条曲线
 | `camera/pose3d/trails` `positions` | 轨迹、每人 3D 位置（短标签带距离与速度） |
 | `world/...` | 世界系视图（`[world].enabled` 时才记） |
 | `person/metrics/<组>/<指标>/<id>` | **人体指标曲线**，按组拆框：`speed` 速度、`size` 高/肩/髀、`length` 躯干/腿/臂展、`gait` 步频/步幅、`fall` 摔倒（躯干角/等级）、`quality` coverage |
+| `person/fall_alert` | **摔倒警报框**（大字文本：⚠ 摔倒 / ⏳ 倒地中 / ✅ 正常） |
+| `person/fall` | 摔倒状态变化日志（只在跳变时记一条） |
 | `person/values` | 每人一行极简数值（短文本，见下方"数值行"） |
 | `person/coords/<id>/{x,y,z}` | 坐标曲线（相机系，默认关） |
 | `person/count` | 人数标量（数据一直在，只是默认不占面板） |
@@ -311,11 +325,14 @@ uv run d435i-person --metrics-views fall   # 只看摔倒那两条曲线
 | `length` | `torso`、`leg`、`arm_span` |
 | `gait` | `cadence`、`stride` |
 | `fall` | `fall_level`（0/1/2）、`torso_angle`（度）|
-| `quality` | `coverage`（有效关节比例，可信度自检） |
+| `alarm` | **摔倒警报框（大字文本，不是曲线）**：`⚠ 摔倒 #1` / `⏳ 倒地中 #2` / `✅ 正常`，下面接报警的人各一行与最近几条状态变化 |
+| `quality` | `coverage`（有效关节比例）。**默认不占格子**（数据照记），想要回来就 `--metrics-views all,quality` |
 
 ```bash
-uv run d435i-person                             # 默认：5 个框的格子
+uv run d435i-person                             # 默认：5 个曲线框 + 摔倒警报框（3×2 格子）
 uv run d435i-person --metrics-views speed,size     # 只看速度与尺寸
+uv run d435i-person --metrics-views fall,alarm     # 只看摔倒曲线 + 警报框
+uv run d435i-person --metrics-views all,quality    # 再加回 coverage 格子
 uv run d435i-person --metrics-views height         # 只给身高一个框
 uv run d435i-person --metrics-layout stack         # 一框一行地堆
 uv run d435i-person --metrics-layout single        # 回到“一个大框全在里面”

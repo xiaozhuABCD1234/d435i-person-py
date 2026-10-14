@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""rerun 可视化：2D 原图/框/骨架、对齐深度、相机系 3D 骨架/点云、世界系视图、人数曲线。
+"""rerun 可视化：2D 原图/框/骨架、对齐深度、相机系 3D 骨架/点云、世界系视图、指标曲线与摔倒警报。
 
 记录到这些实体：
 
@@ -21,6 +21,7 @@
 ``person/coords/<id>/{x,y,z}``       每个人的坐标曲线（相机系，米，默认关）
 ``person/count``                     人数（标量，默认不占面板）
 ``person/events``                    人数变化日志
+``person/fall_alert``                摔倒警报框（大字文本：⚠ 摔倒 / 倒地中 / ✅ 正常）
 ``person/fall``                      摔倒状态变化日志（只在跳变时记一条）
 ===================================  =======================================
 
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import sys
+from collections import deque
 
 import numpy as np
 
@@ -105,10 +107,27 @@ METRIC_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("quality", "可信度", ("coverage",)),
 )
 
+# 摔倒警报框：不是曲线（曲线要去找），而是把当前警报写成大字文本。
+# 默认占一个格子（取代原来的“可信度”）：报警要一眼看到。coverage 曲线照记，
+# 想要回那个格子就把它写进 metrics_views（"all,quality"）。
+ALARM_GROUP = "alarm"
+ALARM_ORIGIN = "person/fall_alert"
+ALARM_LABEL = "摔倒警报"
+
 # 指标 -> 组；没列进去的新指标落到 "other"（数据照记，只是没预置视图）。
 METRIC_GROUP_OF: dict[str, str] = {
     metric: group for group, _, metrics in METRIC_GROUPS for metric in metrics
 }
+
+# 默认格子（顺序就是摆的顺序）：五个曲线组 + 摔倒警报框。
+DEFAULT_METRIC_GROUPS: tuple[str, ...] = (
+    "speed",
+    "size",
+    "length",
+    "gait",
+    "fall",
+    ALARM_GROUP,
+)
 
 
 def metric_path(metric: str, person_id: int) -> str:
@@ -120,25 +139,42 @@ def metric_path(metric: str, person_id: int) -> str:
 def _parse_metric_views(spec: str | None) -> list[tuple[str, str, str]]:
     """把 ``--metrics-views`` 解析成 [(origin, 图名, 组名)]。
 
-    ``"all"``/空 = 所有组（默认）；否则用逗号/空格分隔的组名或指标名，比如
-    ``speed,height,gait``。选到单个指标时就只给它一个框（origin 落到那一级）。
+    ``"all"``/空 = 默认那几格（五个曲线组 + 摔倒警报，**不含 coverage**）；否则用
+    逗号/空格分隔的组名、单个指标名或 ``alarm``，比如 ``speed,size,alarm``。
+    选到单个指标时就只给它一个框（origin 落到那一级）。
     """
-    if not spec or spec.strip().lower() in {"all", "*"}:
-        return [(f"person/metrics/{group}", label, group) for group, label, _ in METRIC_GROUPS]
-    known_groups = {group: label for group, label, _ in METRIC_GROUPS}
+    labels = {group: label for group, label, _ in METRIC_GROUPS}
+    known = {**labels, ALARM_GROUP: ALARM_LABEL}
+    defaults = list(DEFAULT_METRIC_GROUPS)
+    is_all = spec is None or spec.strip().lower() in {"all", "*"}
+    explicit = [] if is_all else spec.replace(",", " ").split()
+
+    def entry_of(token: str) -> tuple[str, str, str] | None:
+        """组名 -> (origin, 图名, 组名)；不是组名就 None（下面再试指标名）。"""
+        if token == ALARM_GROUP:
+            return (ALARM_ORIGIN, ALARM_LABEL, ALARM_GROUP)
+        if token in labels:
+            return (f"person/metrics/{token}", labels[token], token)
+        return None
+
     picked: list[tuple[str, str, str]] = []
     unknown: list[str] = []
-    for token in spec.replace(",", " ").split():
-        if token in known_groups:
-            picked.append((f"person/metrics/{token}", known_groups[token], token))
+    for token in explicit or defaults:
+        if token in {"all", "*"}:
+            # 注意是拼 entry，不是 extend(组名字符串)——那样会把名字按字符拆散
+            picked.extend(entry for group in defaults if (entry := entry_of(group)))
+            continue
+        entry = entry_of(token)
+        if entry is not None:
+            picked.append(entry)
         elif token in METRIC_GROUP_OF:
             group = METRIC_GROUP_OF[token]
             picked.append((f"person/metrics/{group}/{token}", token, group))
         else:
             unknown.append(token)
     if unknown:
-        # 名字打错就静静退回“全都在一个框里”，太容易让人以为自己没改对，影响一下
-        options = " ".join(known_groups) + " 或单个指标名（如 height）"
+        # 名字打错就静静退回默认布局，太容易让人以为自己没改对，影响一下
+        options = " ".join(known) + " 或单个指标名（如 height）"
         print(f"[viz] 认不出的指标组：{', '.join(unknown)}；可选：{options}", file=sys.stderr)
     return picked
 
@@ -159,6 +195,47 @@ def value_line(person) -> str:
         if value is not None and np.isfinite(value):
             parts.append(f"{label} {value:.{digits}f} {unit}")
     return " · ".join(parts)
+
+
+def _fall_detail(person, now: float | None = None) -> str:
+    """警报框里的一行：谁、什么状态、躯干多横、多远、已经多久了。"""
+    level = int(getattr(person, "fall_level", 0))
+    parts = [f"#{person.id}", person.fall_state if level >= 2 else "倒地中"]
+    angle = person.metrics.get("torso_angle")
+    if angle is not None and np.isfinite(angle):
+        parts.append(f"躯干 {angle:.0f}°")
+    if np.isfinite(person.distance):
+        parts.append(f"距 {person.distance:.1f} m")
+    since = getattr(person, "fall_since", None)
+    if since is not None and now is not None:
+        parts.append(f"已 {max(now - since, 0.0):.1f} s")
+    return " · ".join(parts)
+
+
+def fall_alert_panel(people, history=(), now: float | None = None) -> str:
+    """摔倒警报框的文本：大字标题 + 报警的人各一行 + 最近几条状态变化。
+
+    单独拎出来是为了可测（不依赖 rerun）。用文本而不是曲线：报警就该一眼看到，
+    而不是让人去某个曲线框里找哪条线翘起来了。
+    """
+    alive = list(people)
+    alarmed = [p for p in alive if int(getattr(p, "fall_level", 0)) >= 2]
+    down = [
+        p for p in alive if int(getattr(p, "fall_level", 0)) == 1 and getattr(p, "lying", False)
+    ]
+    if alarmed:
+        who = "、".join(f"#{p.id}" for p in alarmed)
+        head = f"# ⚠ 摔倒 {who}" + ("（多人）" if len(alarmed) > 1 else "")
+    elif down:
+        head = "# ⏳ 倒地中 " + "、".join(f"#{p.id}" for p in down)
+    elif alive:
+        head = "# ✅ 正常"
+    else:
+        head = "# ✅ 画面内无人"
+    lines = [head, *(f"- {_fall_detail(person, now)}" for person in [*alarmed, *down])]
+    if history:
+        lines += ["", "最近：" + "；".join(history)]
+    return "\n".join(lines)
 
 
 def _blueprint_module():
@@ -236,6 +313,7 @@ class RerunView:
         self._coords_logged: set[str] = set()
         self._styled_series: set[str] = set()  # 已经声明过颜色的曲线（只声明一次）
         self._fall_levels: dict[int, int] = {}  # 每个人的摔倒等级，用于只在跳变时记事件
+        self._fall_history: deque = deque(maxlen=3)  # 警报框里附的“最近”几条
 
         rr.init(app_id, spawn=False)
         if save_path:
@@ -316,8 +394,13 @@ class RerunView:
         ``metrics_views`` 选组（默认全上），``metrics_layout`` 定摆法。单组时直接
         给个 TimeSeriesView（不再套容器，省一层边框）。
         """
-        picked = self.metric_views or [("person/metrics", "人体指标", "all")]
-        views = [rrb.TimeSeriesView(origin=origin, name=name) for origin, name, _ in picked]
+        picked = self.metric_views or _parse_metric_views("all")
+        views = [
+            rrb.TextDocumentView(origin=origin, name=name)
+            if group == ALARM_GROUP
+            else rrb.TimeSeriesView(origin=origin, name=name)
+            for origin, name, group in picked
+        ]
         if self.metrics_layout == "single":
             # 想要回“一个大框全在里面”就 single
             return rrb.TimeSeriesView(origin="person/metrics", name="人体指标")
@@ -445,7 +528,8 @@ class RerunView:
                     f"{count} person(s): " + ", ".join(f"#{d.id} conf={d.conf:.2f}" for d in live)
                 ),
             )
-        self._log_fall_events(live)
+        self._log_fall_events(live, frame.host_time)
+        self._log_fall_alert(live, frame.host_time)
 
         # 标量一直带时间戳（曲线靠它们画）：人数、人体指标、以及每个人的位置坐标。
         self._set_time(number)
@@ -520,7 +604,7 @@ class RerunView:
         )
         self._log("camera/image/skeleton", rr.LineStrips2D(strips, colors=strip_colors))
 
-    def _log_fall_events(self, live) -> None:
+    def _log_fall_events(self, live, t: float) -> None:
         """摔倒状态一变就记一条 TextLog（rerun 的文本日志面板里能看到整串时间线）。
 
         只在跳变时记，不是每帧都记：报警从“倒地中”到“摔倒”再到“已恢复”一共就几条。
@@ -539,7 +623,21 @@ class RerunView:
                 text = f"#{person.id} 疑似摔倒 / 倒地中{detail}"
             else:
                 text = f"#{person.id} 已恢复正常"
+            self._fall_history.append(f"{t:.1f}s {text}")
             self._log("person/fall", rr.TextLog(text))
+
+    def _log_fall_alert(self, live, t: float) -> None:
+        """摔倒警报框：把当前警报写成大字文本（不是曲线）。
+
+        没报警时也记（内容就一行“正常”），这样框不会空着，也看得出“监控在跑”。
+        """
+        document = getattr(self.rr, "TextDocument", None)
+        if document is None:  # pragma: no cover - 老版本没有 TextDocument
+            return
+        media_type = getattr(self.rr, "MediaType", None)
+        kwargs = {"media_type": media_type.MARKDOWN} if media_type is not None else {}
+        text = fall_alert_panel(live, self._fall_history, t)
+        self._log(ALARM_ORIGIN, document(text, **kwargs))
 
     def _log_values(self, live) -> None:
         """极简数值行：每人一行短文本（距/速/身高/肩宽/髀宽/步频/步幅）。

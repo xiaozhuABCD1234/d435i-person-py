@@ -120,14 +120,28 @@ jpeg_quality = 75
 port = 9876
 
 # 右上角面板。
-#   show_metrics = 人体指标曲线（速度/身高/肩宽/髀宽/腿长/步频/步幅…）
+#   show_metrics = 人体指标曲线 + 摔倒警报框（下面前几个框）
 #   show_values  = 每人一行极简数值（`#1 · 距 2.31 m · 速 1.21 m/s · 行走 · 高 1.72 m`）
 #   show_coords  = X/Y/Z 坐标曲线（默认关，曲线多了不好看）
 #   show_count   = 人数曲线（数据一直在 person/count，只是默认不占面板）
+#
+# metrics_views：右上角那几个框分别是啥（一个框里十几条线根本看不清，所以按组拆）。
+#   speed   速度（speed / speed_ground）
+#   size    尺寸（height / shoulder_width / hip_width）
+#   length  长度（torso / leg / arm_span）
+#   gait    步态（cadence / stride）
+#   fall    摔倒曲线（fall_level / torso_angle）
+#   alarm   摔倒警报（大字文本：⚠ 摔倒 / ⏳ 倒地中 / ✅ 正常）——默认占一个格子
+#   quality 可信度（coverage = 有效关节比例）——默认不占格子，数据照记
+# "all" = 上面除 quality 外全部；也可只挑几个（"speed,size,alarm"），或直接写单个
+# 指标名（"height"）；想把 coverage 格子加回来就写 "all,quality"。
+# metrics_layout：grid = 格子（默认）；stack = 一框一行地堆；single = 全塞回一个框。
 show_metrics = true
 show_values = true
 show_coords = false
 show_count = false
+metrics_views = "all"
+metrics_layout = "grid"
 
 [metrics]
 # 人体指标：速度、步态（步频/步幅）、尺寸（身高/肩宽/髀宽/腿长/臂展）。
